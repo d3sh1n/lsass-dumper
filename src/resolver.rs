@@ -48,6 +48,10 @@ pub const HASH_CLOSE_HANDLE: u32 = djb2_hash_const(b"CloseHandle");
 pub const HASH_GET_FILE_SIZE: u32 = djb2_hash_const(b"GetFileSize");
 pub const HASH_WRITE_FILE: u32 = djb2_hash_const(b"WriteFile");
 pub const HASH_VIRTUAL_PROTECT: u32 = djb2_hash_const(b"VirtualProtect");
+pub const HASH_CREATE_PROCESS_WITH_LOGON_W: u32 = djb2_hash_const(b"CreateProcessWithLogonW");
+pub const HASH_GET_PROCESS_ID: u32 = djb2_hash_const(b"GetProcessId");
+pub const HASH_DUPLICATE_HANDLE: u32 = djb2_hash_const(b"DuplicateHandle");
+pub const HASH_TERMINATE_PROCESS: u32 = djb2_hash_const(b"TerminateProcess");
 pub const HASH_NT_READ_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtReadVirtualMemory");
 pub const HASH_NT_QUERY_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtQueryVirtualMemory");
 

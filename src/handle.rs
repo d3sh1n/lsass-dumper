@@ -25,6 +25,11 @@ impl ProcessHandle {
     pub fn handle(&self) -> HANDLE {
         self.h
     }
+
+    /// Create from a raw HANDLE (takes ownership)
+    pub fn from_raw(h: HANDLE) -> Self {
+        ProcessHandle { h }
+    }
 }
 
 impl Drop for ProcessHandle {

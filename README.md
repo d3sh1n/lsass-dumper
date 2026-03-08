@@ -275,20 +275,6 @@ mimikatz # sekurlsa::logonpasswords
 
 ---
 
-## Detection Surface & OPSEC Notes
-
-| Indicator | Detection | Mitigation in Tool |
-|-----------|-----------|-------------------|
-| Driver file on disk | AV signature (HEUR:Exploit.Win64.VulDriver) | Consider embedded encrypted driver |
-| `CreateServiceW` for driver | Sysmon Event 6 (Driver Load) | Random service name via `-s` |
-| `OpenProcess` on LSASS | Sysmon Event 10 | Use `--method fork` or `dup` |
-| `ReadProcessMemory` on LSASS | EDR memory access callback | Indirect syscalls bypass user-mode hooks |
-| `MiniDumpWriteDump` call | API hook by EDR | ❌ Not used — hand-crafted minidump |
-| Sensitive API imports | Static analysis of IAT | ❌ None — all APIs resolved via PEB walk |
-| Dump file on disk | Content scanning | Use `--encrypt` for XOR obfuscation |
-
----
-
 ## Project Structure
 
 ```

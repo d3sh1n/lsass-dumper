@@ -47,6 +47,7 @@ pub const HASH_DEVICE_IO_CONTROL: u32 = djb2_hash_const(b"DeviceIoControl");
 pub const HASH_CLOSE_HANDLE: u32 = djb2_hash_const(b"CloseHandle");
 pub const HASH_GET_FILE_SIZE: u32 = djb2_hash_const(b"GetFileSize");
 pub const HASH_WRITE_FILE: u32 = djb2_hash_const(b"WriteFile");
+pub const HASH_VIRTUAL_PROTECT: u32 = djb2_hash_const(b"VirtualProtect");
 pub const HASH_NT_READ_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtReadVirtualMemory");
 pub const HASH_NT_QUERY_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtQueryVirtualMemory");
 

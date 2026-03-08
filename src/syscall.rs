@@ -81,8 +81,21 @@ unsafe fn find_syscall_ret(stub_addr: *const u8) -> Option<*const u8> {
 }
 
 // --- Indirect syscall invocation macros ---
-// These use inline assembly to set up registers and jump to the syscall
-// instruction inside ntdll (indirect syscall)
+//
+// These use inline assembly to set up registers and `call` the syscall;ret
+// gadget inside ntdll (indirect syscall).
+//
+// CRITICAL: use `call` not `jmp`. The `ret` after `syscall` needs a return
+// address on the stack. `call` pushes one; `jmp` does not.
+//
+// Stack layout at syscall time (after `call` pushes ret addr):
+//   [rsp]      = return address (pushed by call)
+//   [rsp+0x08] = shadow space (rcx home)
+//   [rsp+0x10] = shadow space (rdx home)
+//   [rsp+0x18] = shadow space (r8 home)
+//   [rsp+0x20] = shadow space (r9 home)
+//   [rsp+0x28] = 5th argument (if any)
+//   [rsp+0x30] = 6th argument (if any)
 
 /// Invoke an indirect syscall with 4 arguments (most common)
 #[allow(unused_macros)]
@@ -90,9 +103,11 @@ macro_rules! indirect_syscall {
     ($entry:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr) => {{
         let status: i32;
         std::arch::asm!(
+            "sub rsp, 0x28",        // shadow space (0x20) + align (0x08)
             "mov r10, rcx",
             "mov eax, {ssn:e}",
-            "jmp {addr}",
+            "call {addr}",          // call syscall;ret → pushes ret addr → ret comes back
+            "add rsp, 0x28",        // cleanup
             ssn = in(reg) $entry.ssn as u32,
             addr = in(reg) $entry.syscall_addr,
             in("rcx") $a1 as u64,
@@ -110,17 +125,23 @@ macro_rules! indirect_syscall {
 pub(crate) use indirect_syscall;
 
 /// Invoke an indirect syscall with 5 arguments (e.g., NtReadVirtualMemory)
-/// 5th arg goes to [rsp+0x28] per Windows x64 calling convention
+///
+/// Before sub: rsp = SP (16-aligned in function body)
+/// After sub 0x28: rsp = SP - 0x28 (8 mod 16, correct for call)
+/// 5th arg at [rsp+0x20] = [SP - 0x08]
+/// After call pushes ret addr: rsp = SP - 0x30 (16-aligned)
+/// Kernel reads 5th from [rsp+0x28] = [SP - 0x08] ✓
 #[allow(unused_macros)]
 macro_rules! indirect_syscall5 {
     ($entry:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr) => {{
         let status: i32;
         std::arch::asm!(
-            "sub rsp, 0x38",       // Shadow space (0x20) + 5th arg (0x8) + alignment (0x10)
-            "mov [rsp+0x28], {a5}",// 5th argument on stack
+            "sub rsp, 0x28",           // shadow (0x20) + 5th arg (0x08)
+            "mov [rsp+0x20], {a5}",    // 5th arg placement
             "mov r10, rcx",
             "mov eax, {ssn:e}",
-            "jmp {addr}",
+            "call {addr}",             // call → push ret addr → syscall → ret here
+            "add rsp, 0x28",           // cleanup
             a5 = in(reg) $a5 as u64,
             ssn = in(reg) $entry.ssn as u32,
             addr = in(reg) $entry.syscall_addr,
@@ -144,12 +165,13 @@ macro_rules! indirect_syscall6 {
     ($entry:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
         let status: i32;
         std::arch::asm!(
-            "sub rsp, 0x40",        // Shadow space + 5th,6th args + alignment
-            "mov [rsp+0x28], {a5}", // 5th argument
-            "mov [rsp+0x30], {a6}", // 6th argument
+            "sub rsp, 0x38",           // shadow (0x20) + 5th,6th (0x10) + align (0x08)
+            "mov [rsp+0x20], {a5}",    // 5th arg → after call at [rsp+0x28]
+            "mov [rsp+0x28], {a6}",    // 6th arg → after call at [rsp+0x30]
             "mov r10, rcx",
             "mov eax, {ssn:e}",
-            "jmp {addr}",
+            "call {addr}",
+            "add rsp, 0x38",
             a5 = in(reg) $a5 as u64,
             a6 = in(reg) $a6 as u64,
             ssn = in(reg) $entry.ssn as u32,

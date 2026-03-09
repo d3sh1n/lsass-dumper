@@ -172,13 +172,66 @@ pub fn create_minidump(
 }
 
 fn collect_system_info() -> MinidumpSystemInfo {
-    let mut info = OSVERSIONINFOW {
-        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
-        ..Default::default()
-    };
-    unsafe {
-        let _ = GetVersionExW(&mut info);
+    // IMPORTANT: GetVersionExW lies on Win10/11 — returns 6.2 (Win8) without manifest.
+    // mimikatz/pypykatz use build_number to select lsasrv.dll offsets, so wrong version
+    // = wrong patterns = "ERROR kuhl_m_sekurlsa_acquireLSA ; Logon list".
+    // Use RtlGetVersion from ntdll which ALWAYS returns the real OS version.
+    #[repr(C)]
+    struct RtlOsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform_id: u32,
+        csd_version: [u16; 128],
     }
+
+    let mut info = RtlOsVersionInfoW {
+        size: std::mem::size_of::<RtlOsVersionInfoW>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform_id: 0,
+        csd_version: [0u16; 128],
+    };
+
+    unsafe {
+        // RtlGetVersion is exported by ntdll.dll and always returns real version
+        let ntdll =
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("ntdll.dll"));
+        if let Ok(ntdll) = ntdll {
+            let proc = windows::Win32::System::LibraryLoader::GetProcAddress(
+                ntdll,
+                windows::core::s!("RtlGetVersion"),
+            );
+            if let Some(func) = proc {
+                type FnRtlGetVersion = unsafe extern "system" fn(*mut RtlOsVersionInfoW) -> i32;
+                let rtl_get_version: FnRtlGetVersion = std::mem::transmute(func);
+                let _ = rtl_get_version(&mut info);
+            }
+        }
+    }
+
+    // Fallback: if RtlGetVersion failed, info fields will be 0
+    // This shouldn't happen but guard against it
+    if info.build == 0 {
+        let mut os_info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            let _ = GetVersionExW(&mut os_info);
+        }
+        info.major = os_info.dwMajorVersion;
+        info.minor = os_info.dwMinorVersion;
+        info.build = os_info.dwBuildNumber;
+        info.platform_id = 2;
+    }
+
+    println!(
+        "    OS Version: {}.{} Build {}",
+        info.major, info.minor, info.build
+    );
 
     let mut sys = SYSTEM_INFO::default();
     unsafe {
@@ -191,9 +244,9 @@ fn collect_system_info() -> MinidumpSystemInfo {
         processor_revision: sys.wProcessorRevision,
         number_of_processors: sys.dwNumberOfProcessors as u8,
         product_type: 0,
-        major_version: info.dwMajorVersion,
-        minor_version: info.dwMinorVersion,
-        build_number: info.dwBuildNumber,
+        major_version: info.major,
+        minor_version: info.minor,
+        build_number: info.build,
         platform_id: 2, // VER_PLATFORM_WIN32_NT
         csd_version_rva: 0,
         suite_mask: 0,

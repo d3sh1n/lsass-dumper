@@ -1,6 +1,6 @@
 # 🔓 LSASS Dumper
 
-> BYOVD-based LSASS credential dumper — bypasses PPL protection via kernel R/W, builds a hand-crafted minidump compatible with pypykatz/mimikatz.
+> BYOVD-based LSASS credential dumper — bypasses PPL protection via kernel R/W or DM_KernelSyscall physical memory exploitation, builds a hand-crafted minidump compatible with pypykatz/mimikatz.
 
 ## ⚠️ Disclaimer
 
@@ -31,22 +31,24 @@ This tool is for **authorized security research and red team operations only**. 
 │ resolver.rs │   driver.rs   │  kernel_rw.rs │    ppl.rs     │
 │ PEB walk    │ SCM load/     │ IOCTL-based   │ EPROCESS walk │
 │ DJB2 hash   │ unload driver │ kernel R/W    │ PPL zeroing   │
-│ API resolve │               │               │               │
+│ API resolve │               │ (viragt mode) │ ntoskrnl base │
 ├─────────────┼───────────────┼───────────────┼───────────────┤
-│ handle.rs   │ minidump.rs   │  syscall.rs   │  crypto.rs    │
-│ LSASS PID   │ MDMP builder  │ Hell's Gate   │ XOR encrypt   │
-│ OpenProcess │ memory dump   │ indirect call │ key generation│
+│ sfdrv64.rs  │ handle.rs     │  minidump.rs  │  syscall.rs   │
+│ DM_Kernel   │ LSASS PID     │ MDMP builder  │ Hell's Gate   │
+│ Syscall via │ OpenProcess   │ memory dump   │ indirect call │
+│ sfdrvx64.sys│               │               │               │
 ├─────────────┼───────────────┼───────────────┼───────────────┤
-│ offsets.rs  │  dumper.rs    │               │               │
-│ EPROCESS    │  (stub)       │               │               │
+│ offsets.rs  │  crypto.rs    │  etw.rs       │  seclogon.rs  │
+│ EPROCESS    │  XOR encrypt  │  ETW bypass   │  handle leak  │
 │ per-build   │               │               │               │
 └─────────────┴───────────────┴───────────────┴───────────────┘
 ```
 
 ---
 
-## Attack Chain
+## Attack Chains
 
+### Mode 1: viragt (Virtual Memory IOCTL)
 ```
 Step 0  ─→  PEB Walk → Resolve APIs dynamically (no IAT footprint)
 Step 1  ─→  SCM → Load vulnerable driver as kernel service
@@ -57,6 +59,23 @@ Step 5  ─→  VirtualQueryEx + ReadProcessMemory → Build minidump
 Step 6  ─→  Restore original Protection value
 Step 7  ─→  Cleanup (close handles, optionally unload driver)
 ```
+
+### Mode 2: sfdrv (DM_KernelSyscall — Physical Memory)
+```
+Step 0  ─→  PEB Walk → Resolve APIs dynamically
+Step 1  ─→  SCM → Load sfdrvx64.sys as kernel service
+Step 2  ─→  Open "\\.\Speedfan" → Locate NtShutdownSystem in physical memory
+            ├── Registry → Physical memory ranges
+            ├── LoadLibraryEx(ntoskrnl.exe) → NtShutdownSystem RVA + ref bytes
+            └── Scan physical memory via IOCTL reads → Match → Verify trampoline
+Step 3  ─→  Patch trampoline → JMP ZwOpenProcess → Call from user-mode
+            → Kernel-mode ZwOpenProcess(LSASS, PROCESS_ALL_ACCESS)
+            → ZwDuplicateObject → User-mode handle (bypasses PPL entirely)
+Step 4  ─→  NtReadVirtualMemory → Build minidump
+Step 5  ─→  Cleanup
+```
+
+> **Note**: DM_KernelSyscall mode does not need PPL/ETW bypass — all operations execute in Ring 0 via physical memory code patching (AxiomDumper technique).
 
 ---
 
@@ -101,20 +120,33 @@ OpenSCManagerW(SC_MANAGER_ALL_ACCESS)
 Implements RAII via `DriverGuard` — on drop: `ControlService(STOP)` → `DeleteService()`.  
 For drivers that BSOD on unload (e.g., viragt64.sys), `--no-unload` uses `std::mem::forget()` to skip cleanup.
 
-### 3. Kernel Read/Write (`kernel_rw.rs`)
+### 3. Kernel Read/Write
 
-#### viragt64.sys Backend (current)
+#### viragt64.sys Backend (`kernel_rw.rs`)
 
 | Operation | IOCTL | Input Buffer Layout |
 |-----------|-------|-------------------|
 | **Read** | `0x82730028` | `[addr: u64 @0x00, len: u32 @0x18]` |
 | **Write** | `0x8273007C` | `[dest: u64 @0x00, val1: u64 @0x08, val2: u64 @0x10]` |
 
-- **Read**: Uses MDL (Memory Descriptor List) mapping with per-byte `MmIsAddressValid` checks — safer than RTCore64
+- **Read**: Uses MDL mapping with per-byte `MmIsAddressValid` checks
 - **Write**: Writes 2 QWORDs atomically via `_InterlockedExchange64` at DISPATCH_LEVEL
-- **Sub-QWORD writes**: Read-modify-write pattern (read containing QWORD → patch target bytes → write back)
+- **Sub-QWORD writes**: Read-modify-write pattern
 
-These IOCTLs were discovered via IDA reverse engineering of the `IRP_MJ_DEVICE_CONTROL` dispatch handler. Only the process-kill IOCTL `0x82730030` was publicly documented.
+#### sfdrvx64.sys Backend (`sfdrv64.rs`) — DM_KernelSyscall
+
+| Operation | IOCTL | Input/Output Layout |
+|-----------|-------|-------------------|
+| **PhyRead** | `0x9C402428` | Input: `[phys_addr: u64]` → Output: `[N bytes]` |
+| **PhyWrite** | `0x9C40242C` | Input: `[phys_addr: u64][data: N bytes]` |
+
+Uses the SpeedFan driver's physical memory IOCTLs for AxiomDumper-style DM_KernelSyscall:
+1. Scan physical memory for `ntoskrnl!NtShutdownSystem` code bytes
+2. Patch with `JMP [target_func]` shellcode
+3. Call `ntdll!NtShutdownSystem` from user-mode → executes target kernel function
+4. Restore original bytes
+
+This enables calling arbitrary kernel functions (ZwOpenProcess, ZwDuplicateObject, etc.) from user-mode, completely bypassing PPL, ETW, and SACL protections.
 
 ### 4. PPL Bypass (`ppl.rs`)
 
@@ -237,14 +269,14 @@ Output format:  [key_len: u32 LE] [key: N bytes] [encrypted_data]
 # Build
 cargo build --release
 
-# Basic usage (requires Administrator)
-lsass-dumper.exe
+# Mode 1: viragt64 — virtual memory R/W (requires PPL bypass)
+lsass-dumper.exe -d viragt64.sys -s viragt64 -t viragt -m seclogon
 
-# Custom options
-lsass-dumper.exe -d viragt64.sys -o lsass.dmp -m direct
+# Mode 2: sfdrvx64 — DM_KernelSyscall (no PPL bypass needed)
+lsass-dumper.exe -d sfdrvx64.sys -s speedfan -t sfdrv
 
 # With encryption
-lsass-dumper.exe --encrypt
+lsass-dumper.exe -d sfdrvx64.sys -s speedfan -t sfdrv --encrypt
 
 # Allow driver unload (dangerous for viragt64 — may BSOD)
 lsass-dumper.exe --no-unload=false
@@ -257,7 +289,8 @@ lsass-dumper.exe --no-unload=false
 | `-d, --driver` | `viragt64.sys` | Path to vulnerable driver |
 | `-o, --output` | `lsass.dmp` | Output dump file path |
 | `-s, --service-name` | `viragt64` | Windows service name |
-| `-m, --method` | `direct` | Handle method: `direct` / `fork` / `dup` |
+| `-t, --driver-type` | `viragt` | Driver type: `viragt` / `sfdrv` |
+| `-m, --method` | `seclogon` | Handle method (viragt only): `direct` / `fork` / `dup` / `seclogon` |
 | `--encrypt` | `false` | XOR encrypt the dump |
 | `--no-restore` | `false` | Skip restoring PPL after dump |
 | `--no-unload` | `true` | Skip driver unload on exit |
@@ -283,13 +316,16 @@ src/
 ├── resolver.rs    # PEB walk + DJB2 hash API resolution
 ├── driver.rs      # SCM driver load/unload (RAII)
 ├── kernel_rw.rs   # Kernel R/W via viragt64.sys IOCTLs
+├── sfdrv64.rs     # DM_KernelSyscall via sfdrvx64.sys physical memory R/W
 ├── ppl.rs         # PPL bypass (EPROCESS.Protection zeroing)
 ├── offsets.rs     # Per-build EPROCESS field offsets
 ├── handle.rs      # LSASS PID finder + handle acquisition
+├── seclogon.rs    # Seclogon handle leak (PID spoofing)
 ├── minidump.rs    # Hand-crafted MDMP builder
 ├── syscall.rs     # Hell's Gate / Halo's Gate indirect syscalls
+├── etw.rs         # ETW bypass (user-mode patch)
 ├── crypto.rs      # XOR encryption for dump output
-└── dumper.rs      # (stub — legacy, replaced by minidump.rs)
+└── dumper.rs      # (stub)
 ```
 
 ---
@@ -319,6 +355,7 @@ Release profile optimizations:
 
 ## References
 
+- [AxiomDumper](https://github.com/AxiomSchema/AxiomDumper) — DM_KernelSyscall technique for physical memory code execution
 - [mimikatz](https://github.com/gentilkiwi/mimikatz) — Original LSASS credential extraction
 - [pypykatz](https://github.com/skelsec/pypykatz) — Python LSASS parser
 - [PPLKiller](https://github.com/RedCursorSecurityConsulting/PPLKiller) — PPL bypass via RTCore64

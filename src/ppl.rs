@@ -18,7 +18,7 @@ pub struct PplState {
 
 /// Bypass PPL protection on a target process
 pub fn bypass_ppl(
-    krw: &KernelRW,
+    krw: &dyn KernelRW,
     offsets: &EprocessOffsets,
     target_pid: u32,
 ) -> Result<PplState, String> {
@@ -80,7 +80,7 @@ pub fn bypass_ppl(
 
 /// Restore PPL protection
 pub fn restore_ppl(
-    krw: &KernelRW,
+    krw: &dyn KernelRW,
     _offsets: &EprocessOffsets,
     state: &PplState,
 ) -> Result<(), String> {
@@ -287,7 +287,7 @@ unsafe fn get_peb() -> *mut u8 {
 
 /// Walk EPROCESS linked list to find process by PID
 fn walk_process_list(
-    krw: &KernelRW,
+    krw: &dyn KernelRW,
     offsets: &EprocessOffsets,
     system_eprocess: u64,
     target_pid: u32,

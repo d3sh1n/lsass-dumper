@@ -54,6 +54,8 @@ pub const HASH_DUPLICATE_HANDLE: u32 = djb2_hash_const(b"DuplicateHandle");
 pub const HASH_TERMINATE_PROCESS: u32 = djb2_hash_const(b"TerminateProcess");
 pub const HASH_NT_READ_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtReadVirtualMemory");
 pub const HASH_NT_QUERY_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtQueryVirtualMemory");
+pub const HASH_NT_DEVICE_IO_CONTROL_FILE: u32 = djb2_hash_const(b"NtDeviceIoControlFile");
+pub const HASH_NT_SHUTDOWN_SYSTEM: u32 = djb2_hash_const(b"NtShutdownSystem");
 
 /// Compile-time DJB2 hash computation
 pub const fn djb2_hash_const(s: &[u8]) -> u32 {

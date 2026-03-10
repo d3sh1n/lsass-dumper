@@ -24,6 +24,11 @@ windows = { version = "0.58", features = [
     "Wdk_System_SystemServices",
 ]}
 clap = { version = "4", features = ["derive"] }
+obfstr = "0.4"
+
+[features]
+default = []
+driver-loader = []    # Include SCM driver load/unload logic
 
 [profile.release]
 opt-level = "z"

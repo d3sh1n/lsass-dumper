@@ -135,9 +135,11 @@ pub fn load_driver(
         let started = start_svc(service, 0, std::ptr::null());
         if !started.as_bool() {
             let err = GetLastError();
-            // 1056 = ERROR_SERVICE_ALREADY_RUNNING (driver loaded this session)
-            // 1058 = ERROR_SERVICE_DISABLED (leftover service from --no-unload run)
-            if err.0 != 1056 && err.0 != 1058 {
+            // 1056 = ERROR_SERVICE_ALREADY_RUNNING
+            // 1058 = ERROR_SERVICE_DISABLED
+            // 183  = ERROR_ALREADY_EXISTS (driver loaded via other path)
+            // 1072 = ERROR_SERVICE_MARKED_FOR_DELETE (pending delete from prev run)
+            if err.0 != 1056 && err.0 != 1058 && err.0 != 183 && err.0 != 1072 {
                 let del_svc: FnDeleteService =
                     std::mem::transmute(api.advapi32(HASH_DELETE_SERVICE).unwrap());
                 del_svc(service);

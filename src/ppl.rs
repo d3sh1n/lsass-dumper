@@ -130,7 +130,7 @@ pub fn get_ntoskrnl_base_ntapi() -> Result<u64, String> {
             if name.length > 0 && !name.buffer.is_null() {
                 let name_slice =
                     std::slice::from_raw_parts(name.buffer, (name.length / 2) as usize);
-                let hash = resolver::djb2_hash_wide(name_slice);
+                let hash = resolver::api_hash_wide(name_slice);
                 if hash == resolver::HASH_NTDLL {
                     ntdll_base = (*entry).dll_base;
                     break;
@@ -144,7 +144,7 @@ pub fn get_ntoskrnl_base_ntapi() -> Result<u64, String> {
         }
 
         // Resolve NtQuerySystemInformation from ntdll
-        let nqsi_hash = resolver::djb2_hash(b"NtQuerySystemInformation");
+        let nqsi_hash = resolver::api_hash(b"NtQuerySystemInformation");
         let tmp_resolver = resolver::ApiResolver {
             kernel32_base: std::ptr::null_mut(),
             ntdll_base,
@@ -219,7 +219,7 @@ pub fn find_kernel_export_rva(export_name: &[u8]) -> Result<u64, String> {
         .map_err(|e| format!("LoadLibraryExW failed: {}", e))?;
 
         let base = user_ntos.0 as *mut u8;
-        let target_hash = resolver::djb2_hash(export_name);
+        let target_hash = resolver::api_hash(export_name);
 
         // Parse EAT manually
         let addr = resolver::ApiResolver {

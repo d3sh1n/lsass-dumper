@@ -355,7 +355,7 @@ Release profile optimizations:
 
 ## References
 
-- [AxiomDumper](https://github.com/AxiomSchema/AxiomDumper) — DM_KernelSyscall technique for physical memory code execution
+- [AxiomDumper](https://github.com/mallo-m/AxiomDumper) — DM_KernelSyscall technique for physical memory code execution
 - [mimikatz](https://github.com/gentilkiwi/mimikatz) — Original LSASS credential extraction
 - [pypykatz](https://github.com/skelsec/pypykatz) — Python LSASS parser
 - [PPLKiller](https://github.com/RedCursorSecurityConsulting/PPLKiller) — PPL bypass via RTCore64

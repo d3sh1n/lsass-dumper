@@ -50,6 +50,18 @@ pub fn zw_close() -> String {
     obfstr::obfstr!("ZwClose").to_string()
 }
 
+pub fn ps_lookup_process() -> String {
+    obfstr::obfstr!("PsLookupProcessByProcessId").to_string()
+}
+
+pub fn mm_get_physical_address() -> String {
+    obfstr::obfstr!("MmGetPhysicalAddress").to_string()
+}
+
+pub fn obf_deref_object() -> String {
+    obfstr::obfstr!("ObfDereferenceObject").to_string()
+}
+
 /// Physical Memory registry subkey (wide, null-terminated)
 pub fn phys_mem_regkey() -> Vec<u16> {
     let s: String =

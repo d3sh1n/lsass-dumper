@@ -127,6 +127,16 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             token: 0x4B8,
         },
 
+        // Windows 11 25H2 (Build 26200) — EPROCESS restructured!
+        26200 => EprocessOffsets {
+            build_number: build,
+            active_process_links: 0x1D8,
+            unique_process_id: 0x1D0,
+            image_file_name: 0x338,
+            protection: 0x5FA,
+            token: 0x248,
+        },
+
         // Try common offsets for unknown builds in the 19041+ range
         b if b >= 19041 => {
             eprintln!(

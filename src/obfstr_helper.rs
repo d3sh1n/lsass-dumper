@@ -62,6 +62,18 @@ pub fn obf_deref_object() -> String {
     obfstr::obfstr!("ObfDereferenceObject").to_string()
 }
 
+pub fn ps_get_process_peb() -> String {
+    obfstr::obfstr!("PsGetProcessPeb").to_string()
+}
+
+pub fn zw_query_virtual_memory() -> String {
+    obfstr::obfstr!("ZwQueryVirtualMemory").to_string()
+}
+
+pub fn zw_read_virtual_memory() -> String {
+    obfstr::obfstr!("ZwReadVirtualMemory").to_string()
+}
+
 /// Physical Memory registry subkey (wide, null-terminated)
 pub fn phys_mem_regkey() -> Vec<u16> {
     let s: String =

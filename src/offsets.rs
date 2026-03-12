@@ -12,6 +12,7 @@ pub struct EprocessOffsets {
     pub image_file_name: u64,
     pub protection: u64,
     pub token: u64,
+    pub vad_root: u64,
 }
 
 /// Detect current Windows version and return matching EPROCESS offsets
@@ -55,6 +56,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x450,
             protection: 0x6CA,
             token: 0x360,
+            vad_root: 0x628,
         },
 
         // Windows 10 1903/1909 (Build 18362/18363)
@@ -65,6 +67,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x450,
             protection: 0x6CA,
             token: 0x360,
+            vad_root: 0x658,
         },
 
         // Windows 10 2004/20H2/21H1 (Build 19041/19042/19043)
@@ -75,6 +78,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x5A8,
             protection: 0x87A,
             token: 0x4B8,
+            vad_root: 0x7D8,
         },
 
         // Windows 10 21H2/22H2 (Build 19044/19045)
@@ -85,6 +89,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x5A8,
             protection: 0x87A,
             token: 0x4B8,
+            vad_root: 0x7D8,
         },
 
         // Windows 11 21H2 (Build 22000)
@@ -95,6 +100,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x5A8,
             protection: 0x87A,
             token: 0x4B8,
+            vad_root: 0x7D8,
         },
 
         // Windows 11 22H2 (Build 22621)
@@ -105,6 +111,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x5A8,
             protection: 0x87A,
             token: 0x4B8,
+            vad_root: 0x7D8,
         },
 
         // Windows 11 23H2 (Build 22631)
@@ -115,6 +122,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x5A8,
             protection: 0x87A,
             token: 0x4B8,
+            vad_root: 0x7D8,
         },
 
         // Windows 11 24H2 (Build 26100)
@@ -125,6 +133,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x5A8,
             protection: 0x87A,
             token: 0x4B8,
+            vad_root: 0x7D8,
         },
 
         // Windows 11 25H2 (Build 26200) — EPROCESS restructured!
@@ -135,6 +144,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
             image_file_name: 0x338,
             protection: 0x5FA,
             token: 0x248,
+            vad_root: 0x568,
         },
 
         // Try common offsets for unknown builds in the 19041+ range
@@ -150,6 +160,7 @@ fn get_offsets_for_build(build: u32) -> Option<EprocessOffsets> {
                 image_file_name: 0x5A8,
                 protection: 0x87A,
                 token: 0x4B8,
+                vad_root: 0x7D8,
             })
             .unwrap()
         }

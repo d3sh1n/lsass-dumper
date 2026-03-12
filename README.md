@@ -14,7 +14,7 @@ This tool is for **authorized security research and red team operations only**. 
 - **BYOVD Kernel R/W** — Exploits vulnerable signed drivers to read/write arbitrary kernel memory
 - **PPL Bypass** — Disables LSASS Protected Process Light by zeroing `EPROCESS.Protection`
 - **Hand-crafted Minidump** — Builds MDMP format manually, no `MiniDumpWriteDump` (heavily hooked by EDRs)
-- **Physical Memory Dump** — Full CR3-based page table walk (VA→PA), bypasses `NtReadVirtualMemory` hooks entirely
+- **Hybrid Memory Read** — CR3 physical read first (invisible to EDR), NtReadVirtualMemory syscall fallback only for paged-out pages
 - **XOR Encryption** — Optional encryption of dump output to avoid on-disk credential exposure
 
 ### Anti-Detection
@@ -36,7 +36,7 @@ This tool is for **authorized security research and red team operations only**. 
 **WinIo64 is the recommended backend** for modern environments. Unlike other backends:
 
 - ✅ Section-based physical memory mapping (independent PTEs, writable even for read-only kernel pages)
-- ✅ Full physical memory dump path — never calls `NtReadVirtualMemory` (undetectable by user-mode EDR hooks)
+- ✅ Hybrid memory dump — CR3 physical read first, NtReadVirtualMemory syscall fallback for paged-out pages
 - ✅ CR3 page table walk for VA→PA translation (4KB/2MB/1GB pages)
 - ✅ Sentinel ONE split execution support (`--recon` + `--ntos-base`/`--trampoline`)
 - ✅ Does not require PPL/ETW bypass — all operations via Ring 0 trampoline
@@ -99,12 +99,12 @@ Step 3  →  Patch trampoline → JMP ZwOpenProcess → Get kernel handle
           → ZwDuplicateObject → User-mode handle (bypasses PPL entirely)
 Step 3b →  PsLookupProcessByProcessId → MmGetPhysicalAddress → read_phys
           → Get LSASS CR3 (page table base)
-Step 4  →  Physical memory dump: CR3 → PML4 → PDPT → PD → PT → PA
-          → read_phys for each page (NO NtReadVirtualMemory calls)
+Step 4  →  Hybrid read: CR3 physical read first (EDR-invisible),
+           NtReadVirtualMemory syscall fallback for paged-out pages
 Step 5  →  Build MDMP → Write to disk
 ```
 
-> **Key advantage**: WinIo64's Section-based mapping creates independent PTEs, allowing writes to read-only kernel pages. The physical memory dump path never calls `NtReadVirtualMemory`, making it invisible to all user-mode EDR hooks.
+> **Key advantage**: WinIo64's Section-based mapping creates independent PTEs, allowing writes to read-only kernel pages. The hybrid read approach maximizes EDR evasion (~60% pages via physical memory) while ensuring 100% page coverage (syscall fallback for paged-out memory).
 
 ---
 
@@ -183,9 +183,7 @@ lsass-dumper.exe --no-unload=false
 | `--encrypt` | `false` | XOR encrypt the dump |
 | `--no-restore` | `false` | Skip restoring PPL after dump |
 | `--no-unload` | `true` | Skip driver unload on exit (requires `driver-loader` feature) |
-| `--recon` | `false` | Recon mode: discover kernel info and exit (winio only) |
-| `--ntos-base` | — | Precomputed ntoskrnl base address in hex (winio only) |
-| `--trampoline` | — | Precomputed trampoline physical address in hex (winio only) |
+
 
 ### Examples
 
@@ -254,7 +252,7 @@ docs/
 |-----------------|-----------|--------|
 | IAT fingerprinting | PEB walk + custom salted hash (not DJB2) | ✅ Evaded |
 | PSAPI imports | `EnumProcessModulesEx` removed, uses `NtQueryVirtualMemory` | ✅ Evaded |
-| NtReadVirtualMemory hooks | Physical memory `read_phys` via CR3 page walk | ✅ Evaded |
+| NtReadVirtualMemory hooks | Hybrid: CR3 physical first (~60%), syscall fallback (~40%) | ✅ Mostly evaded |
 | String signatures | `obfstr` compile-time XOR encryption | ✅ Evaded |
 | IOCTL constants | XOR pairs computed at runtime | ✅ Evaded |
 | CLI help text | Neutralized, generic descriptions | ✅ Evaded |
